@@ -174,8 +174,8 @@ pub fn resume_supported_slash_commands() -> Vec<&'static SlashCommandSpec> {
 #[must_use]
 pub fn render_slash_command_help() -> String {
     let mut lines = vec![
-        "Available commands:".to_string(),
-        "  (resume-safe commands are marked with [resume])".to_string(),
+        "Slash commands".to_string(),
+        "  [resume] means the command also works with --resume SESSION.json".to_string(),
     ];
     for spec in slash_command_specs() {
         let name = match spec.argument_hint {
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn renders_help_from_shared_specs() {
         let help = render_slash_command_help();
-        assert!(help.contains("resume-safe commands"));
+        assert!(help.contains("works with --resume SESSION.json"));
         assert!(help.contains("/help"));
         assert!(help.contains("/status"));
         assert!(help.contains("/compact"));
@@ -340,7 +340,7 @@ mod tests {
         let result = handle_slash_command("/help", &session, CompactionConfig::default())
             .expect("help command should be handled");
         assert_eq!(result.session, session);
-        assert!(result.message.contains("Available commands:"));
+        assert!(result.message.contains("Slash commands"));
     }
 
     #[test]

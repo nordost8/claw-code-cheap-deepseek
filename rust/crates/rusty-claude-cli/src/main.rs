@@ -623,7 +623,14 @@ impl LiveCli {
             true,
             permission_mode_label(),
         )?;
-        println!("Cleared local session history.");
+        println!(
+            "Session cleared
+  Mode             fresh session
+  Preserved model  {}
+  Permission mode  {}",
+            self.model,
+            permission_mode_label()
+        );
         Ok(())
     }
 
@@ -685,10 +692,16 @@ impl LiveCli {
 }
 
 fn render_repl_help() -> String {
-    format!(
-        "{}
-  /exit                Quit the REPL",
-        render_slash_command_help()
+    [
+        "REPL".to_string(),
+        "  /exit                Quit the REPL".to_string(),
+        "  /quit                Quit the REPL".to_string(),
+        String::new(),
+        render_slash_command_help(),
+    ]
+    .join(
+        "
+",
     )
 }
 
@@ -1352,8 +1365,16 @@ mod tests {
     }
 
     #[test]
+    fn shared_help_uses_resume_annotation_copy() {
+        let help = commands::render_slash_command_help();
+        assert!(help.contains("Slash commands"));
+        assert!(help.contains("works with --resume SESSION.json"));
+    }
+
+    #[test]
     fn repl_help_includes_shared_commands_and_exit() {
         let help = render_repl_help();
+        assert!(help.contains("REPL"));
         assert!(help.contains("/help"));
         assert!(help.contains("/status"));
         assert!(help.contains("/model [model]"));
