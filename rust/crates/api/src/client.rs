@@ -41,12 +41,9 @@ impl AnthropicClient {
     }
 
     pub fn from_env() -> Result<Self, ApiError> {
-        Ok(Self::new(read_api_key()?).with_base_url(
-            std::env::var("ANTHROPIC_BASE_URL")
-                .ok()
-                .or_else(|| std::env::var("CLAUDE_CODE_API_BASE_URL").ok())
-                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-        ))
+        Ok(Self::new(read_api_key()?)
+            .with_auth_token(read_auth_token())
+            .with_base_url(read_base_url()))
     }
 
     #[must_use]
@@ -150,15 +147,19 @@ impl AnthropicClient {
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
+        let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let resolved_base_url = self.base_url.trim_end_matches('/');
+        eprintln!("[anthropic-client] resolved_base_url={resolved_base_url}");
+        eprintln!("[anthropic-client] request_url={request_url}");
         let mut request_builder = self
             .http
-            .post(format!(
-                "{}/v1/messages",
-                self.base_url.trim_end_matches('/')
-            ))
+            .post(&request_url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json");
+
+        let auth_header = self.auth_token.as_ref().map(|_| "Bearer [REDACTED]").unwrap_or("<absent>");
+        eprintln!("[anthropic-client] headers x-api-key=[REDACTED] authorization={auth_header} anthropic-version={ANTHROPIC_VERSION} content-type=application/json");
 
         if let Some(auth_token) = &self.auth_token {
             request_builder = request_builder.bearer_auth(auth_token);
@@ -186,10 +187,10 @@ impl AnthropicClient {
 }
 
 fn read_api_key() -> Result<String, ApiError> {
-    match std::env::var("ANTHROPIC_AUTH_TOKEN") {
+    match std::env::var("ANTHROPIC_API_KEY") {
         Ok(api_key) if !api_key.is_empty() => Ok(api_key),
         Ok(_) => Err(ApiError::MissingApiKey),
-        Err(std::env::VarError::NotPresent) => match std::env::var("ANTHROPIC_API_KEY") {
+        Err(std::env::VarError::NotPresent) => match std::env::var("ANTHROPIC_AUTH_TOKEN") {
             Ok(api_key) if !api_key.is_empty() => Ok(api_key),
             Ok(_) => Err(ApiError::MissingApiKey),
             Err(std::env::VarError::NotPresent) => Err(ApiError::MissingApiKey),
@@ -197,6 +198,17 @@ fn read_api_key() -> Result<String, ApiError> {
         },
         Err(error) => Err(ApiError::from(error)),
     }
+}
+
+fn read_auth_token() -> Option<String> {
+    match std::env::var("ANTHROPIC_AUTH_TOKEN") {
+        Ok(token) if !token.is_empty() => Some(token),
+        _ => None,
+    }
+}
+
+fn read_base_url() -> String {
+    std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
 }
 
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -312,15 +324,22 @@ mod tests {
     }
 
     #[test]
-    fn read_api_key_prefers_auth_token() {
+    fn read_api_key_prefers_api_key_env() {
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
         std::env::set_var("ANTHROPIC_API_KEY", "legacy-key");
         assert_eq!(
-            super::read_api_key().expect("token should load"),
-            "auth-token"
+            super::read_api_key().expect("api key should load"),
+            "legacy-key"
         );
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn read_auth_token_reads_auth_token_env() {
+        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
+        assert_eq!(super::read_auth_token().as_deref(), Some("auth-token"));
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
     }
 
     #[test]
