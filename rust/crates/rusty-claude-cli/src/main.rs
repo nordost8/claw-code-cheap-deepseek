@@ -5164,15 +5164,15 @@ fn build_runtime_with_plugin_state(
             tool_registry.clone(),
             progress_reporter,
         )?),
-        ProviderKind::OpenAi | ProviderKind::Xai => CliApiClient::OpenAiCompat(
-            ProviderBackedRuntimeClient::new(
+        ProviderKind::OpenAi | ProviderKind::Xai | ProviderKind::DeepSeek => {
+            CliApiClient::OpenAiCompat(ProviderBackedRuntimeClient::new(
                 model,
                 enable_tools,
                 emit_output,
                 allowed_tools.clone(),
                 tool_registry.clone(),
-            )?,
-        ),
+            )?)
+        }
     };
     let mut runtime = ConversationRuntime::new_with_features(
         session,
@@ -5485,7 +5485,7 @@ impl ProviderBackedRuntimeClient {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let resolved = api::resolve_model_alias(&model);
         match detect_provider_kind(&resolved) {
-            ProviderKind::OpenAi | ProviderKind::Xai => {}
+            ProviderKind::OpenAi | ProviderKind::Xai | ProviderKind::DeepSeek => {}
             _ => {
                 return Err(format!(
                     "OpenAI-compat runtime requires deepseek-*, grok*, or OpenAI model (got {resolved})"

@@ -33,6 +33,8 @@ pub enum ProviderKind {
     Anthropic,
     Xai,
     OpenAi,
+    /// DeepSeek-V3.2 via OpenAI-compatible API (`DEEPSEEK_API_KEY`).
+    DeepSeek,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +50,14 @@ pub struct ModelTokenLimit {
     pub max_output_tokens: u32,
     pub context_window_tokens: u32,
 }
+
+/// Shared metadata for all DeepSeek model aliases (see `MODEL_REGISTRY`).
+const DEEPSEEK_PROVIDER: ProviderMetadata = ProviderMetadata {
+    provider: ProviderKind::DeepSeek,
+    auth_env: "DEEPSEEK_API_KEY",
+    base_url_env: "DEEPSEEK_API_BASE",
+    default_base_url: openai_compat::DEFAULT_DEEPSEEK_BASE_URL,
+};
 
 const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
     (
@@ -122,6 +132,11 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         },
     ),
+    ("deepseek-chat", DEEPSEEK_PROVIDER),
+    ("deepseek-reasoner", DEEPSEEK_PROVIDER),
+    ("ds-chat", DEEPSEEK_PROVIDER),
+    ("reasoner", DEEPSEEK_PROVIDER),
+    ("r1", DEEPSEEK_PROVIDER),
 ];
 
 #[must_use]
@@ -142,6 +157,11 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "grok" | "grok-3" => "grok-3",
                     "grok-mini" | "grok-3-mini" => "grok-3-mini",
                     "grok-2" => "grok-2",
+                    _ => trimmed,
+                },
+                ProviderKind::DeepSeek => match *alias {
+                    "deepseek-chat" | "ds-chat" => "deepseek-chat",
+                    "deepseek-reasoner" | "reasoner" | "r1" => "deepseek-reasoner",
                     _ => trimmed,
                 },
                 ProviderKind::OpenAi => trimmed,
@@ -169,21 +189,22 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         });
     }
-    if canonical.to_ascii_lowercase().starts_with("deepseek") {
-        return Some(ProviderMetadata {
-            provider: ProviderKind::OpenAi,
-            auth_env: "DEEPSEEK_API_KEY",
-            base_url_env: "DEEPSEEK_API_BASE",
-            default_base_url: openai_compat::DEFAULT_DEEPSEEK_BASE_URL,
-        });
+    if matches!(
+        canonical.as_str(),
+        "deepseek-chat" | "deepseek-reasoner"
+    ) {
+        return Some(DEEPSEEK_PROVIDER);
     }
     None
 }
 
 #[must_use]
 pub(crate) fn openai_compat_config_for_model(model: &str) -> openai_compat::OpenAiCompatConfig {
-    let lower = resolve_model_alias(model).to_ascii_lowercase();
-    if lower.starts_with("deepseek") {
+    let canonical = resolve_model_alias(model);
+    if matches!(
+        canonical.as_str(),
+        "deepseek-chat" | "deepseek-reasoner"
+    ) {
         openai_compat::OpenAiCompatConfig::deepseek()
     } else {
         openai_compat::OpenAiCompatConfig::openai()
@@ -202,7 +223,7 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
         return ProviderKind::OpenAi;
     }
     if openai_compat::has_api_key("DEEPSEEK_API_KEY") {
-        return ProviderKind::OpenAi;
+        return ProviderKind::DeepSeek;
     }
     if openai_compat::has_api_key("XAI_API_KEY") {
         return ProviderKind::Xai;
@@ -225,18 +246,21 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
     )
 }
 
+/// Per DeepSeek API **Models & Pricing** (both chat & reasoner: 128K context).
+/// Max output: `deepseek-chat` 8K; `deepseek-reasoner` 64K (includes chain-of-thought + answer).
+/// <https://api-docs.deepseek.com/quick_start/pricing>
 #[must_use]
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     let canonical = resolve_model_alias(model);
-    let lower = canonical.to_ascii_lowercase();
-    // DeepSeek caps max output (8192); context window per API docs order of 64k–128k input.
-    if lower.starts_with("deepseek") {
-        return Some(ModelTokenLimit {
-            max_output_tokens: 8_192,
-            context_window_tokens: 128_000,
-        });
-    }
     match canonical.as_str() {
+        "deepseek-chat" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 128 * 1024,
+        }),
+        "deepseek-reasoner" => Some(ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 128 * 1024,
+        }),
         "claude-opus-4-6" => Some(ModelTokenLimit {
             max_output_tokens: 32_000,
             context_window_tokens: 200_000,
@@ -309,13 +333,20 @@ mod tests {
     }
 
     #[test]
+    fn resolves_deepseek_aliases() {
+        assert_eq!(resolve_model_alias("ds-chat"), "deepseek-chat");
+        assert_eq!(resolve_model_alias("reasoner"), "deepseek-reasoner");
+        assert_eq!(resolve_model_alias("r1"), "deepseek-reasoner");
+    }
+
+    #[test]
     fn detects_provider_from_model_name_first() {
         assert_eq!(detect_provider_kind("grok"), ProviderKind::Xai);
         assert_eq!(
             detect_provider_kind("claude-sonnet-4-6"),
             ProviderKind::Anthropic
         );
-        assert_eq!(detect_provider_kind("deepseek-chat"), ProviderKind::OpenAi);
+        assert_eq!(detect_provider_kind("deepseek-chat"), ProviderKind::DeepSeek);
     }
 
     #[test]
@@ -323,6 +354,7 @@ mod tests {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
         assert_eq!(max_tokens_for_model("deepseek-chat"), 8192);
+        assert_eq!(max_tokens_for_model("deepseek-reasoner"), 64_000);
     }
 
     #[test]
@@ -338,6 +370,18 @@ mod tests {
                 .expect("grok-mini should resolve to a registered model")
                 .context_window_tokens,
             131_072
+        );
+        assert_eq!(
+            model_token_limit("deepseek-chat")
+                .expect("deepseek-chat should be registered")
+                .context_window_tokens,
+            128 * 1024
+        );
+        assert_eq!(
+            model_token_limit("deepseek-reasoner")
+                .expect("deepseek-reasoner should be registered")
+                .context_window_tokens,
+            128 * 1024
         );
     }
 

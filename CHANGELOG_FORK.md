@@ -15,6 +15,11 @@ Track **your** releases on top of **upstream** Claw Code.
 
 ## History
 
+### 2026-04-06 — DeepSeek as first-class `ProviderKind`
+
+- `ProviderKind::DeepSeek`, `ProviderClient::DeepSeek`, registry aliases: `deepseek-chat`, `deepseek-reasoner`, `ds-chat`, `reasoner`, `r1`.
+- `model_token_limit` / preflight: per [DeepSeek Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing) — 128K context both models; max output 8K (chat) / 64K (reasoner).
+
 ### 2026-04-06 — sync upstream
 
 - Upstream: `instructkr/claw-code` @ `f7321ca05d095b3682f35cdcee6bcdfd37b30a2e` (`upstream/main` at fetch time)
