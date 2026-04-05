@@ -105,3 +105,5 @@ See **`GITHUB_SETUP.md`**.
 Для бота в Telegram — другий репо **`ductor-claw-code`**, там свій **`SETUP.md`**.
 
 Публікація на GitHub — **`GITHUB_SETUP.md`**.
+
+Оновлення з основного Claw: **`docs/UPSTREAM_SYNC.md`**, скрипт **`./scripts/sync-upstream.sh`**.
