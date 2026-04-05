@@ -81,10 +81,14 @@ To control this CLI from Telegram, use the **Ductor** fork with the `claw` provi
 
 ## Syncing from upstream
 
+See **[docs/UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md)** for branch model, which files are “fork-owned”, and merge vs rebase. Quick fetch + reminder:
+
 ```bash
-git fetch upstream
-git merge upstream/main
+./scripts/sync-upstream.sh
+git merge upstream/main   # or: git rebase upstream/main
 ```
+
+Log each sync in **`CHANGELOG_FORK.md`**.
 
 ## GitHub publish
 

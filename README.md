@@ -1,6 +1,6 @@
 # Rewriting Project Claw Code
 
-**Cheap DeepSeek fork:** suggested GitHub repo name **`claw-code-cheap-deepseek`**. Step-by-step setup (build, `DEEPSEEK_API_KEY`, test): **[SETUP.md](SETUP.md)** · publish: **[GITHUB_SETUP.md](GITHUB_SETUP.md)**
+**Cheap DeepSeek fork:** suggested GitHub repo name **`claw-code-cheap-deepseek`**. Setup: **[SETUP.md](SETUP.md)** · publish: **[GITHUB_SETUP.md](GITHUB_SETUP.md)** · **updating from upstream Claw:** **[docs/UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md)**
 
 <p align="center">
   <strong>⭐ The fastest repo in history to surpass 50K stars, reaching the milestone in just 2 hours after publication ⭐</strong>
