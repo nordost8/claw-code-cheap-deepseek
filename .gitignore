@@ -2,9 +2,11 @@ __pycache__/
 .env
 .port_sessions/
 rust/.claw/
+rust/.claude/
+rust/crates/rusty-claude-cli/.claw/
 archive/
 .omx/
 .clawd-agents/
-# Claude Code local artifacts
+# Claude Code local artifacts (never commit — may contain chat/tool transcripts)
 .claude/settings.local.json
 .claude/sessions/
