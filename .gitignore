@@ -2,6 +2,8 @@ __pycache__/
 .env
 .port_sessions/
 rust/.claw/
+# Local Claw sessions at repo root (never commit)
+.claw/
 rust/.claude/
 rust/crates/rusty-claude-cli/.claw/
 archive/

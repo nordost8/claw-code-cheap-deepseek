@@ -1,43 +1,37 @@
 # claw-code-cheap-deepseek
 
-## Example (CLI)
+Fork of **[Claw Code](https://github.com/instructkr/claw-code)** (upstream: `instructkr/claw-code`) tuned for **[DeepSeek](https://www.deepseek.com/)** via **`DEEPSEEK_API_KEY`**. Anthropic / OpenAI / xAI шляхи лишаються там, де їх підтримує апстрім.
 
-Same class of work as in Telegram, but from the terminal:
+## Швидкий приклад CLI
 
 ```bash
-export DEEPSEEK_API_KEY=sk-...   # see SETUP.md
+export DEEPSEEK_API_KEY=sk-...   # див. SETUP.md
 cd /path/to/your/repo
 claw --model deepseek-chat --permission-mode workspace-write prompt \
   "Create a small Python script using Pillow that draws the Ukrainian flag (blue over yellow), write ua_flag.png, run it, and confirm the file exists."
 ```
 
-**Agent:** plans steps, writes the script, runs it in the workspace, and returns a **text result** (paths, stdout). For chat + file delivery, pair with **[Ductor Claw Code](https://github.com/nordost8/ductor-claw-code)** on Telegram.
+Для Telegram: **[nordost8/ductor-claw-code](https://github.com/nordost8/ductor-claw-code)**.
 
-Illustrative — tools and sandboxing follow your Claw build and flags (`--dangerously-skip-permissions`, Docker, etc.).
+| Документ | Призначення |
+|----------|-------------|
+| **[SETUP.md](SETUP.md)** | Збірка, env, smoke test |
+| **[USAGE.md](USAGE.md)** | Поточний CLI, сесії, parity (з апстріму) |
+| **[docs/UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md)** | Як мерджити апстрім |
+| **[CHANGELOG_FORK.md](CHANGELOG_FORK.md)** | Лог синків |
 
----
+## Що змінилося в апстримі (огляд)
 
-**Fork of [Claw Code](https://github.com/instructkr/claw-code)** tuned for **cheap [DeepSeek](https://www.deepseek.com/)** via **`DEEPSEEK_API_KEY`**. Anthropic / OpenAI / xAI paths remain available where upstream supports them.
+Після останнього merge з `upstream/main`: канонічна реалізація в **`rust/`**, здоров’я — **`claw doctor`**, деталі — **`rust/README.md`**, **`PARITY.md`**, **`ROADMAP.md`**, контейнерний флоу — **`docs/container.md`**.
 
-## Quick links
+Швидкий старт з сорцу:
 
-| Doc | Purpose |
-|-----|---------|
-| **[SETUP.md](SETUP.md)** | Build, env, smoke test |
-| **[docs/UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md)** | Merge from main Claw repo, conflict map |
-| **[CHANGELOG_FORK.md](CHANGELOG_FORK.md)** | Log each upstream sync |
-| **[GITHUB_SETUP.md](GITHUB_SETUP.md)** | Remotes |
+```bash
+cd rust
+cargo build --workspace
+./target/debug/claw --help
+```
 
-**Telegram stack:** [nordost8/ductor-claw-code](https://github.com/nordost8/ductor-claw-code)
+## Ліцензія
 
-## Upstream (vanilla Claw Code)
-
-Full history, layout, ecosystem:
-
-**[instructkr/claw-code — README (main)](https://github.com/instructkr/claw-code/blob/main/README.md)**
-
-This fork tracks `upstream` = `https://github.com/instructkr/claw-code.git`. Sync: `./scripts/sync-upstream.sh` then merge/rebase.
-
-## License
-
-Same as upstream (see [LICENSE](LICENSE) if present in tree).
+Як у апстрімі (див. [LICENSE](LICENSE) у дереві).

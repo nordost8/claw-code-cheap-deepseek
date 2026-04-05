@@ -12,7 +12,7 @@ use crate::types::{
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
-use super::{Provider, ProviderFuture};
+use super::{preflight_message_request, Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -141,6 +141,7 @@ impl OpenAiCompatClient {
             stream: false,
             ..request.clone()
         };
+        preflight_message_request(&request)?;
         let response = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(response.headers());
         let payload = response.json::<ChatCompletionResponse>().await?;
@@ -155,6 +156,7 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
+        preflight_message_request(request)?;
         let response = self
             .send_with_retry(&request.clone().with_streaming())
             .await?;
