@@ -1,4 +1,7 @@
 __pycache__/
+.env
+.port_sessions/
+rust/.claw/
 archive/
 .omx/
 .clawd-agents/

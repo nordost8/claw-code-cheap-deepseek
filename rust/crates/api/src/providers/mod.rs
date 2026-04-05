@@ -158,7 +158,25 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         });
     }
+    if canonical.to_ascii_lowercase().starts_with("deepseek") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DEEPSEEK_API_KEY",
+            base_url_env: "DEEPSEEK_API_BASE",
+            default_base_url: openai_compat::DEFAULT_DEEPSEEK_BASE_URL,
+        });
+    }
     None
+}
+
+#[must_use]
+pub(crate) fn openai_compat_config_for_model(model: &str) -> openai_compat::OpenAiCompatConfig {
+    let lower = resolve_model_alias(model).to_ascii_lowercase();
+    if lower.starts_with("deepseek") {
+        openai_compat::OpenAiCompatConfig::deepseek()
+    } else {
+        openai_compat::OpenAiCompatConfig::openai()
+    }
 }
 
 #[must_use]
@@ -172,6 +190,9 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if openai_compat::has_api_key("OPENAI_API_KEY") {
         return ProviderKind::OpenAi;
     }
+    if openai_compat::has_api_key("DEEPSEEK_API_KEY") {
+        return ProviderKind::OpenAi;
+    }
     if openai_compat::has_api_key("XAI_API_KEY") {
         return ProviderKind::Xai;
     }
@@ -181,6 +202,11 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
     let canonical = resolve_model_alias(model);
+    let lower = canonical.to_ascii_lowercase();
+    // DeepSeek Chat API rejects requests when max_tokens exceeds its per-model cap (8192 for deepseek-chat).
+    if lower.starts_with("deepseek") {
+        return 8192;
+    }
     if canonical.contains("opus") {
         32_000
     } else {
@@ -206,11 +232,13 @@ mod tests {
             detect_provider_kind("claude-sonnet-4-6"),
             ProviderKind::Anthropic
         );
+        assert_eq!(detect_provider_kind("deepseek-chat"), ProviderKind::OpenAi);
     }
 
     #[test]
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+        assert_eq!(max_tokens_for_model("deepseek-chat"), 8192);
     }
 }

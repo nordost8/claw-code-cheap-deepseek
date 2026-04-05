@@ -24,9 +24,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
+    detect_provider_kind, max_tokens_for_model as provider_max_tokens_for_model,
     resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache, ProviderClient,
+    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -53,11 +54,31 @@ use serde_json::json;
 use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
+
+fn default_model_from_env() -> String {
+    let has_anthropic = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some()
+        || std::env::var("ANTHROPIC_AUTH_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .is_some();
+    let has_deepseek = std::env::var("DEEPSEEK_API_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some();
+    if has_deepseek && !has_anthropic {
+        return "deepseek-chat".to_string();
+    }
+    DEFAULT_MODEL.to_string()
+}
+
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
     } else {
-        64_000
+        provider_max_tokens_for_model(model)
     }
 }
 const DEFAULT_DATE: &str = "2026-03-31";
@@ -210,7 +231,7 @@ impl CliOutputFormat {
 
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    let mut model = DEFAULT_MODEL.to_string();
+    let mut model = default_model_from_env();
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
     let mut wants_help = false;
@@ -1612,8 +1633,22 @@ struct RuntimeMcpState {
     degraded_report: Option<runtime::McpDegradedReport>,
 }
 
+enum CliApiClient {
+    Anthropic(AnthropicRuntimeClient),
+    OpenAiCompat(ProviderBackedRuntimeClient),
+}
+
+impl ApiClient for CliApiClient {
+    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        match self {
+            Self::Anthropic(client) => client.stream(request),
+            Self::OpenAiCompat(client) => client.stream(request),
+        }
+    }
+}
+
 struct BuiltRuntime {
-    runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
+    runtime: Option<ConversationRuntime<CliApiClient, CliToolExecutor>>,
     plugin_registry: PluginRegistry,
     plugins_active: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
@@ -1622,7 +1657,7 @@ struct BuiltRuntime {
 
 impl BuiltRuntime {
     fn new(
-        runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+        runtime: ConversationRuntime<CliApiClient, CliToolExecutor>,
         plugin_registry: PluginRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
@@ -1667,7 +1702,7 @@ impl BuiltRuntime {
 }
 
 impl Deref for BuiltRuntime {
-    type Target = ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>;
+    type Target = ConversationRuntime<CliApiClient, CliToolExecutor>;
 
     fn deref(&self) -> &Self::Target {
         self.runtime
@@ -4365,17 +4400,30 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
-    let mut runtime = ConversationRuntime::new_with_features(
-        session,
-        AnthropicRuntimeClient::new(
+    let resolved_for_provider = api::resolve_model_alias(&model);
+    let api_client = match detect_provider_kind(&resolved_for_provider) {
+        ProviderKind::Anthropic => CliApiClient::Anthropic(AnthropicRuntimeClient::new(
             session_id,
-            model,
+            model.clone(),
             enable_tools,
             emit_output,
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
-        )?,
+        )?),
+        ProviderKind::OpenAi | ProviderKind::Xai => CliApiClient::OpenAiCompat(
+            ProviderBackedRuntimeClient::new(
+                model,
+                enable_tools,
+                emit_output,
+                allowed_tools.clone(),
+                tool_registry.clone(),
+            )?,
+        ),
+    };
+    let mut runtime = ConversationRuntime::new_with_features(
+        session,
+        api_client,
         CliToolExecutor::new(
             allowed_tools.clone(),
             emit_output,
@@ -4659,6 +4707,181 @@ impl ApiClient for AnthropicRuntimeClient {
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             let mut events = response_to_events(response, out)?;
             push_prompt_cache_record(&self.client, &mut events);
+            Ok(events)
+        })
+    }
+}
+
+struct ProviderBackedRuntimeClient {
+    runtime: tokio::runtime::Runtime,
+    client: ProviderClient,
+    model: String,
+    enable_tools: bool,
+    emit_output: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    tool_registry: GlobalToolRegistry,
+}
+
+impl ProviderBackedRuntimeClient {
+    fn new(
+        model: String,
+        enable_tools: bool,
+        emit_output: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        tool_registry: GlobalToolRegistry,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let resolved = api::resolve_model_alias(&model);
+        match detect_provider_kind(&resolved) {
+            ProviderKind::OpenAi | ProviderKind::Xai => {}
+            _ => {
+                return Err(format!(
+                    "OpenAI-compat runtime requires deepseek-*, grok*, or OpenAI model (got {resolved})"
+                )
+                .into());
+            }
+        }
+        let client = ProviderClient::from_model(&resolved)
+            .map_err(|error| -> Box<dyn std::error::Error> { error.to_string().into() })?;
+        Ok(Self {
+            runtime: tokio::runtime::Runtime::new()?,
+            client,
+            model: resolved,
+            enable_tools,
+            emit_output,
+            allowed_tools,
+            tool_registry,
+        })
+    }
+}
+
+impl ApiClient for ProviderBackedRuntimeClient {
+    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        let message_request = MessageRequest {
+            model: self.model.clone(),
+            max_tokens: max_tokens_for_model(&self.model),
+            messages: convert_messages(&request.messages),
+            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
+            tools: self
+                .enable_tools
+                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
+            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+            stream: true,
+        };
+
+        self.runtime.block_on(async {
+            let mut stream = self
+                .client
+                .stream_message(&message_request)
+                .await
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let mut stdout = io::stdout();
+            let mut sink = io::sink();
+            let out: &mut dyn Write = if self.emit_output {
+                &mut stdout
+            } else {
+                &mut sink
+            };
+            let renderer = TerminalRenderer::new();
+            let mut markdown_stream = MarkdownStreamState::default();
+            let mut events = Vec::new();
+            let mut pending_tool: Option<(String, String, String)> = None;
+            let mut saw_stop = false;
+
+            while let Some(event) = stream
+                .next_event()
+                .await
+                .map_err(|error| RuntimeError::new(error.to_string()))?
+            {
+                match event {
+                    ApiStreamEvent::MessageStart(start) => {
+                        for block in start.message.content {
+                            push_output_block(block, out, &mut events, &mut pending_tool, true)?;
+                        }
+                    }
+                    ApiStreamEvent::ContentBlockStart(start) => {
+                        push_output_block(
+                            start.content_block,
+                            out,
+                            &mut events,
+                            &mut pending_tool,
+                            true,
+                        )?;
+                    }
+                    ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
+                        ContentBlockDelta::TextDelta { text } => {
+                            if !text.is_empty() {
+                                if let Some(rendered) = markdown_stream.push(&renderer, &text) {
+                                    write!(out, "{rendered}")
+                                        .and_then(|()| out.flush())
+                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                }
+                                events.push(AssistantEvent::TextDelta(text));
+                            }
+                        }
+                        ContentBlockDelta::InputJsonDelta { partial_json } => {
+                            if let Some((_, _, input)) = &mut pending_tool {
+                                input.push_str(&partial_json);
+                            }
+                        }
+                        ContentBlockDelta::ThinkingDelta { .. }
+                        | ContentBlockDelta::SignatureDelta { .. } => {}
+                    },
+                    ApiStreamEvent::ContentBlockStop(_) => {
+                        if let Some(rendered) = markdown_stream.flush(&renderer) {
+                            write!(out, "{rendered}")
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
+                        if let Some((id, name, input)) = pending_tool.take() {
+                            writeln!(out, "\n{}", format_tool_call_start(&name, &input))
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            events.push(AssistantEvent::ToolUse { id, name, input });
+                        }
+                    }
+                    ApiStreamEvent::MessageDelta(delta) => {
+                        events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                    }
+                    ApiStreamEvent::MessageStop(_) => {
+                        saw_stop = true;
+                        if let Some(rendered) = markdown_stream.flush(&renderer) {
+                            write!(out, "{rendered}")
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
+                        events.push(AssistantEvent::MessageStop);
+                    }
+                }
+            }
+
+            push_prompt_cache_for_provider_client(&self.client, &mut events);
+
+            if !saw_stop
+                && events.iter().any(|event| {
+                    matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
+                        || matches!(event, AssistantEvent::ToolUse { .. })
+                })
+            {
+                events.push(AssistantEvent::MessageStop);
+            }
+
+            if events
+                .iter()
+                .any(|event| matches!(event, AssistantEvent::MessageStop))
+            {
+                return Ok(events);
+            }
+
+            let response = self
+                .client
+                .send_message(&MessageRequest {
+                    stream: false,
+                    ..message_request.clone()
+                })
+                .await
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let mut events = response_to_events(response, out)?;
+            push_prompt_cache_for_provider_client(&self.client, &mut events);
             Ok(events)
         })
     }
@@ -5300,6 +5523,14 @@ fn response_to_events(
     events.push(AssistantEvent::Usage(response.usage.token_usage()));
     events.push(AssistantEvent::MessageStop);
     Ok(events)
+}
+
+fn push_prompt_cache_for_provider_client(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
+    if let Some(record) = client.take_last_prompt_cache_record() {
+        if let Some(event) = prompt_cache_record_to_runtime_event(record) {
+            events.push(AssistantEvent::PromptCache(event));
+        }
+    }
 }
 
 fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {

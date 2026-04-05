@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 
 from .bootstrap_graph import build_bootstrap_graph
 from .command_graph import build_command_graph
@@ -88,6 +89,32 @@ def build_parser() -> argparse.ArgumentParser:
     exec_tool_parser = subparsers.add_parser('exec-tool', help='execute a mirrored tool shim by exact name')
     exec_tool_parser.add_argument('name')
     exec_tool_parser.add_argument('payload')
+
+    deepseek_parser = subparsers.add_parser(
+        'deepseek',
+        help='send a prompt to DeepSeek (OpenAI-compatible API); uses DEEPSEEK_API_KEY',
+    )
+    deepseek_parser.add_argument(
+        'prompt',
+        nargs='*',
+        help='user message (optional with --bootstrap / --with-workspace-summary)',
+    )
+    deepseek_parser.add_argument(
+        '--bootstrap',
+        action='store_true',
+        help='build a local bootstrap session report, then ask DeepSeek to analyse it',
+    )
+    deepseek_parser.add_argument(
+        '--with-workspace-summary',
+        action='store_true',
+        help='prepend Markdown workspace summary from the Python port manifest',
+    )
+    deepseek_parser.add_argument('--system', default=None, help='optional system prompt')
+    deepseek_parser.add_argument(
+        '--model',
+        default=None,
+        help='override DEEPSEEK_MODEL (default deepseek-chat)',
+    )
     return parser
 
 
@@ -205,6 +232,48 @@ def main(argv: list[str] | None = None) -> int:
         result = execute_tool(args.name, args.payload)
         print(result.message)
         return 0 if result.handled else 1
+    if args.command == 'deepseek':
+        from .deepseek_client import chat_completion, simple_prompt
+
+        user_focus = ' '.join(args.prompt).strip()
+        parts: list[str] = []
+        if args.with_workspace_summary:
+            parts.append(QueryEnginePort(manifest).render_summary())
+        if args.bootstrap:
+            seed = user_focus or 'porting workspace status'
+            parts.append(PortRuntime().bootstrap_session(seed, limit=5).as_markdown())
+        if parts:
+            body = '\n\n---\n\n'.join(parts)
+            instruction = (
+                user_focus
+                if user_focus
+                else 'Коротко підсумуй стан Python-порту, ключові ризики та наступні кроки. Відповідь українською.'
+            )
+            user_content = f'{body}\n\n---\n\nКористувач: {instruction}'
+        else:
+            if not user_focus:
+                print(
+                    'Вкажи текст запиту або використай --bootstrap / --with-workspace-summary.',
+                    file=sys.stderr,
+                )
+                return 1
+            user_content = user_focus
+        try:
+            if args.system:
+                text, _ = chat_completion(
+                    [
+                        {'role': 'system', 'content': args.system},
+                        {'role': 'user', 'content': user_content},
+                ],
+                    model=args.model,
+                )
+                print(text)
+            else:
+                print(simple_prompt(user_content, model=args.model))
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
     parser.error(f'unknown command: {args.command}')
     return 2
 

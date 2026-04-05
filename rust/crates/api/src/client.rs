@@ -32,7 +32,7 @@ impl ProviderClient {
                 OpenAiCompatConfig::xai(),
             )?)),
             ProviderKind::OpenAi => Ok(Self::OpenAi(OpenAiCompatClient::from_env(
-                OpenAiCompatConfig::openai(),
+                providers::openai_compat_config_for_model(&resolved_model),
             )?)),
         }
     }

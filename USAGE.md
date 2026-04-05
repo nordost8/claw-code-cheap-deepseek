@@ -6,9 +6,13 @@ This guide covers the current Rust workspace under `rust/` and the `claw` CLI bi
 
 - Rust toolchain with `cargo`
 - One of:
-  - `ANTHROPIC_API_KEY` for direct API access
-  - `claw login` for OAuth-based auth
-- Optional: `ANTHROPIC_BASE_URL` when targeting a proxy or local service
+  - `ANTHROPIC_API_KEY` for direct API access (Claude)
+  - `DEEPSEEK_API_KEY` for DeepSeek (`deepseek-chat` and other `deepseek-*` models; OpenAI-compatible API)
+  - `OPENAI_API_KEY` / `XAI_API_KEY` for other OpenAI-compatible providers
+  - `claw login` for OAuth-based auth (Anthropic)
+- Optional: `ANTHROPIC_BASE_URL`, `DEEPSEEK_API_BASE`, `OPENAI_BASE_URL`, `XAI_BASE_URL` for proxies
+
+If both `DEEPSEEK_API_KEY` and Anthropic env keys are unset, the default model stays Claude. If only `DEEPSEEK_API_KEY` is set (no Anthropic token), the default model becomes `deepseek-chat`.
 
 ## Build the workspace
 
