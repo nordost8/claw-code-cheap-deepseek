@@ -106,9 +106,15 @@ async fn send_message_posts_json_and_parses_response() {
 #[tokio::test]
 async fn send_message_blocks_oversized_requests_before_the_http_call() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    // Preflight calls POST /v1/messages/count_tokens first; must return valid JSON or preflight
+    // silently skips and the test no longer sees ApiError::ContextWindowExceeded.
     let server = spawn_server(
         state.clone(),
-        vec![http_response("200 OK", "application/json", "{}")],
+        vec![http_response(
+            "200 OK",
+            "application/json",
+            r#"{"input_tokens":250000}"#,
+        )],
     )
     .await;
 
@@ -132,9 +138,12 @@ async fn send_message_blocks_oversized_requests_before_the_http_call() {
         .expect_err("oversized request should fail local context-window preflight");
 
     assert!(matches!(error, ApiError::ContextWindowExceeded { .. }));
-    assert!(
-        state.lock().await.is_empty(),
-        "preflight failure should avoid any upstream HTTP request"
+    let captured = state.lock().await;
+    assert_eq!(captured.len(), 1, "preflight should call count_tokens once");
+    assert_eq!(
+        captured[0].path,
+        "/v1/messages/count_tokens",
+        "oversized request should fail after token count, before POST /v1/messages"
     );
 }
 

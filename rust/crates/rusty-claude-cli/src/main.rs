@@ -32,10 +32,11 @@ use api::{
 };
 
 use commands::{
-    handle_agents_slash_command, handle_mcp_slash_command, handle_mcp_slash_command_json,
-    handle_plugins_slash_command, handle_skills_slash_command, handle_skills_slash_command_json,
-    render_slash_command_help, resume_supported_slash_commands, slash_command_specs,
-    validate_slash_command_input, SlashCommand,
+    classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
+    handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
+    handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
+    resume_supported_slash_commands, slash_command_specs, validate_slash_command_input,
+    SkillSlashDispatch, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -52,7 +53,7 @@ use runtime::{
     Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
@@ -148,6 +149,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             args,
             output_format,
         } => LiveCli::print_skills(args.as_deref(), output_format)?,
+        CliAction::Plugins {
+            action,
+            target,
+            output_format,
+        } => LiveCli::print_plugins(action.as_deref(), target.as_deref(), output_format)?,
         CliAction::PrintSystemPrompt {
             cwd,
             date,
@@ -206,6 +212,11 @@ enum CliAction {
     },
     Skills {
         args: Option<String>,
+        output_format: CliOutputFormat,
+    },
+    Plugins {
+        action: Option<String>,
+        target: Option<String>,
         output_format: CliOutputFormat,
     },
     PrintSystemPrompt {
@@ -440,10 +451,22 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             args: join_optional_args(&rest[1..]),
             output_format,
         }),
-        "skills" => Ok(CliAction::Skills {
-            args: join_optional_args(&rest[1..]),
-            output_format,
-        }),
+        "skills" => {
+            let args = join_optional_args(&rest[1..]);
+            match classify_skills_slash_command(args.as_deref()) {
+                SkillSlashDispatch::Invoke(prompt) => Ok(CliAction::Prompt {
+                    prompt,
+                    model,
+                    output_format,
+                    allowed_tools,
+                    permission_mode,
+                }),
+                SkillSlashDispatch::Local => Ok(CliAction::Skills {
+                    args,
+                    output_format,
+                }),
+            }
+        }
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
         "login" => Ok(CliAction::Login { output_format }),
         "logout" => Ok(CliAction::Logout { output_format }),
@@ -461,7 +484,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode,
             })
         }
-        other if other.starts_with('/') => parse_direct_slash_cli_action(&rest, output_format),
+        other if other.starts_with('/') => parse_direct_slash_cli_action(
+            &rest,
+            model,
+            output_format,
+            allowed_tools,
+            permission_mode,
+        ),
         _other => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
             model,
@@ -553,7 +582,10 @@ fn join_optional_args(args: &[String]) -> Option<String> {
 
 fn parse_direct_slash_cli_action(
     rest: &[String],
+    model: String,
     output_format: CliOutputFormat,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
 ) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
@@ -571,10 +603,21 @@ fn parse_direct_slash_cli_action(
             },
             output_format,
         }),
-        Ok(Some(SlashCommand::Skills { args })) => Ok(CliAction::Skills {
-            args,
-            output_format,
-        }),
+        Ok(Some(SlashCommand::Skills { args })) => {
+            match classify_skills_slash_command(args.as_deref()) {
+                SkillSlashDispatch::Invoke(prompt) => Ok(CliAction::Prompt {
+                    prompt,
+                    model,
+                    output_format,
+                    allowed_tools,
+                    permission_mode,
+                }),
+                SkillSlashDispatch::Local => Ok(CliAction::Skills {
+                    args,
+                    output_format,
+                }),
+            }
+        }
         Ok(Some(SlashCommand::Unknown(name))) => Err(format_unknown_direct_slash_command(&name)),
         Ok(Some(command)) => Err({
             let _ = command;
@@ -607,6 +650,10 @@ fn format_unknown_direct_slash_command(name: &str) -> String {
         message.push('\n');
         message.push_str(&suggestions);
     }
+    if let Some(note) = omc_compatibility_note_for_unknown_slash_command(name) {
+        message.push('\n');
+        message.push_str(note);
+    }
     message.push_str("\nRun `claw --help` for CLI usage, or start `claw` and use /help.");
     message
 }
@@ -618,8 +665,19 @@ fn format_unknown_slash_command(name: &str) -> String {
         message.push('\n');
         message.push_str(&suggestions);
     }
+    if let Some(note) = omc_compatibility_note_for_unknown_slash_command(name) {
+        message.push('\n');
+        message.push_str(note);
+    }
     message.push_str("\n  Help             /help lists available slash commands");
     message
+}
+
+fn omc_compatibility_note_for_unknown_slash_command(name: &str) -> Option<&'static str> {
+    name.starts_with("oh-my-claudecode:")
+        .then_some(
+            "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `claw` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
+        )
 }
 
 fn render_suggestion_line(label: &str, suggestions: &[String]) -> Option<String> {
@@ -891,6 +949,7 @@ struct DiagnosticCheck {
     level: DiagnosticLevel,
     summary: String,
     details: Vec<String>,
+    data: Map<String, Value>,
 }
 
 impl DiagnosticCheck {
@@ -900,12 +959,44 @@ impl DiagnosticCheck {
             level,
             summary: summary.into(),
             details: Vec::new(),
+            data: Map::new(),
         }
     }
 
     fn with_details(mut self, details: Vec<String>) -> Self {
         self.details = details;
         self
+    }
+
+    fn with_data(mut self, data: Map<String, Value>) -> Self {
+        self.data = data;
+        self
+    }
+
+    fn json_value(&self) -> Value {
+        let mut value = Map::from_iter([
+            (
+                "name".to_string(),
+                Value::String(self.name.to_ascii_lowercase()),
+            ),
+            (
+                "status".to_string(),
+                Value::String(self.level.label().to_string()),
+            ),
+            ("summary".to_string(), Value::String(self.summary.clone())),
+            (
+                "details".to_string(),
+                Value::Array(
+                    self.details
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+        ]);
+        value.extend(self.data.clone());
+        Value::Object(value)
     }
 }
 
@@ -915,26 +1006,29 @@ struct DoctorReport {
 }
 
 impl DoctorReport {
+    fn counts(&self) -> (usize, usize, usize) {
+        (
+            self.checks
+                .iter()
+                .filter(|check| check.level == DiagnosticLevel::Ok)
+                .count(),
+            self.checks
+                .iter()
+                .filter(|check| check.level == DiagnosticLevel::Warn)
+                .count(),
+            self.checks
+                .iter()
+                .filter(|check| check.level == DiagnosticLevel::Fail)
+                .count(),
+        )
+    }
+
     fn has_failures(&self) -> bool {
         self.checks.iter().any(|check| check.level.is_failure())
     }
 
     fn render(&self) -> String {
-        let ok_count = self
-            .checks
-            .iter()
-            .filter(|check| check.level == DiagnosticLevel::Ok)
-            .count();
-        let warn_count = self
-            .checks
-            .iter()
-            .filter(|check| check.level == DiagnosticLevel::Warn)
-            .count();
-        let fail_count = self
-            .checks
-            .iter()
-            .filter(|check| check.level == DiagnosticLevel::Fail)
-            .count();
+        let (ok_count, warn_count, fail_count) = self.counts();
         let mut lines = vec![
             "Doctor".to_string(),
             format!(
@@ -943,6 +1037,28 @@ impl DoctorReport {
         ];
         lines.extend(self.checks.iter().map(render_diagnostic_check));
         lines.join("\n\n")
+    }
+
+    fn json_value(&self) -> Value {
+        let report = self.render();
+        let (ok_count, warn_count, fail_count) = self.counts();
+        json!({
+            "kind": "doctor",
+            "message": report,
+            "report": report,
+            "has_failures": self.has_failures(),
+            "summary": {
+                "total": self.checks.len(),
+                "ok": ok_count,
+                "warnings": warn_count,
+                "failures": fail_count,
+            },
+            "checks": self
+                .checks
+                .iter()
+                .map(DiagnosticCheck::json_value)
+                .collect::<Vec<_>>(),
+        })
     }
 }
 
@@ -1001,15 +1117,9 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     let message = report.render();
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
-        CliOutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "doctor",
-                "message": message,
-                "report": message,
-                "has_failures": report.has_failures(),
-            }))?
-        ),
+        CliOutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report.json_value())?);
+        }
     }
     if report.has_failures() {
         return Err("doctor found failing checks".into());
@@ -1017,6 +1127,7 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn check_auth_health() -> DiagnosticCheck {
     let api_key_present = env::var("ANTHROPIC_API_KEY")
         .ok()
@@ -1081,6 +1192,21 @@ fn check_auth_health() -> DiagnosticCheck {
                 },
             )
             .with_details(details)
+            .with_data(Map::from_iter([
+                ("api_key_present".to_string(), json!(api_key_present)),
+                ("auth_token_present".to_string(), json!(auth_token_present)),
+                ("saved_oauth_present".to_string(), json!(true)),
+                ("saved_oauth_expired".to_string(), json!(expired)),
+                (
+                    "saved_oauth_expires_at".to_string(),
+                    json!(token_set.expires_at),
+                ),
+                (
+                    "refresh_token_present".to_string(),
+                    json!(token_set.refresh_token.is_some()),
+                ),
+                ("scopes".to_string(), json!(token_set.scopes)),
+            ]))
         }
         Ok(None) => DiagnosticCheck::new(
             "Auth",
@@ -1103,12 +1229,31 @@ fn check_auth_health() -> DiagnosticCheck {
             } else {
                 "absent"
             }
-        )]),
+        )])
+        .with_data(Map::from_iter([
+            ("api_key_present".to_string(), json!(api_key_present)),
+            ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("saved_oauth_present".to_string(), json!(false)),
+            ("saved_oauth_expired".to_string(), json!(false)),
+            ("saved_oauth_expires_at".to_string(), Value::Null),
+            ("refresh_token_present".to_string(), json!(false)),
+            ("scopes".to_string(), json!(Vec::<String>::new())),
+        ])),
         Err(error) => DiagnosticCheck::new(
             "Auth",
             DiagnosticLevel::Fail,
             format!("failed to inspect saved credentials: {error}"),
-        ),
+        )
+        .with_data(Map::from_iter([
+            ("api_key_present".to_string(), json!(api_key_present)),
+            ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("saved_oauth_present".to_string(), Value::Null),
+            ("saved_oauth_expired".to_string(), Value::Null),
+            ("saved_oauth_expires_at".to_string(), Value::Null),
+            ("refresh_token_present".to_string(), Value::Null),
+            ("scopes".to_string(), Value::Null),
+            ("saved_oauth_error".to_string(), json!(error.to_string())),
+        ])),
     }
 }
 
@@ -1142,7 +1287,7 @@ fn check_config_health(
             } else {
                 details.extend(
                     discovered_paths
-                        .into_iter()
+                        .iter()
                         .map(|path| format!("Discovered file   {path}")),
                 );
             }
@@ -1160,6 +1305,22 @@ fn check_config_health(
                 },
             )
             .with_details(details)
+            .with_data(Map::from_iter([
+                ("discovered_files".to_string(), json!(discovered_paths)),
+                (
+                    "discovered_files_count".to_string(),
+                    json!(discovered_count),
+                ),
+                (
+                    "loaded_config_files".to_string(),
+                    json!(loaded_entries.len()),
+                ),
+                ("resolved_model".to_string(), json!(runtime_config.model())),
+                (
+                    "mcp_servers".to_string(),
+                    json!(runtime_config.mcp().servers().len()),
+                ),
+            ]))
         }
         Err(error) => DiagnosticCheck::new(
             "Config",
@@ -1170,10 +1331,21 @@ fn check_config_health(
             vec!["Discovered files  <none>".to_string()]
         } else {
             discovered_paths
-                .into_iter()
+                .iter()
                 .map(|path| format!("Discovered file   {path}"))
                 .collect()
-        }),
+        })
+        .with_data(Map::from_iter([
+            ("discovered_files".to_string(), json!(discovered_paths)),
+            (
+                "discovered_files_count".to_string(),
+                json!(discovered_count),
+            ),
+            ("loaded_config_files".to_string(), json!(0)),
+            ("resolved_model".to_string(), Value::Null),
+            ("mcp_servers".to_string(), Value::Null),
+            ("load_error".to_string(), json!(error.to_string())),
+        ])),
     }
 }
 
@@ -1215,6 +1387,38 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
             context.memory_file_count, context.loaded_config_files, context.discovered_config_files
         ),
     ])
+    .with_data(Map::from_iter([
+        ("cwd".to_string(), json!(context.cwd.display().to_string())),
+        (
+            "project_root".to_string(),
+            json!(context
+                .project_root
+                .as_ref()
+                .map(|path| path.display().to_string())),
+        ),
+        ("in_git_repo".to_string(), json!(in_repo)),
+        ("git_branch".to_string(), json!(context.git_branch)),
+        (
+            "git_state".to_string(),
+            json!(context.git_summary.headline()),
+        ),
+        (
+            "changed_files".to_string(),
+            json!(context.git_summary.changed_files),
+        ),
+        (
+            "memory_file_count".to_string(),
+            json!(context.memory_file_count),
+        ),
+        (
+            "loaded_config_files".to_string(),
+            json!(context.loaded_config_files),
+        ),
+        (
+            "discovered_config_files".to_string(),
+            json!(context.discovered_config_files),
+        ),
+    ]))
 }
 
 fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
@@ -1245,9 +1449,43 @@ fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
         },
     )
     .with_details(details)
+    .with_data(Map::from_iter([
+        ("enabled".to_string(), json!(status.enabled)),
+        ("active".to_string(), json!(status.active)),
+        ("supported".to_string(), json!(status.supported)),
+        (
+            "namespace_supported".to_string(),
+            json!(status.namespace_supported),
+        ),
+        (
+            "namespace_active".to_string(),
+            json!(status.namespace_active),
+        ),
+        (
+            "network_supported".to_string(),
+            json!(status.network_supported),
+        ),
+        ("network_active".to_string(), json!(status.network_active)),
+        (
+            "filesystem_mode".to_string(),
+            json!(status.filesystem_mode.as_str()),
+        ),
+        (
+            "filesystem_active".to_string(),
+            json!(status.filesystem_active),
+        ),
+        ("allowed_mounts".to_string(), json!(status.allowed_mounts)),
+        ("in_container".to_string(), json!(status.in_container)),
+        (
+            "container_markers".to_string(),
+            json!(status.container_markers),
+        ),
+        ("fallback_reason".to_string(), json!(status.fallback_reason)),
+    ]))
 }
 
 fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
+    let default_model = config.and_then(runtime::RuntimeConfig::model);
     let mut details = vec![
         format!("OS               {} {}", env::consts::OS, env::consts::ARCH),
         format!("Working dir      {}", cwd.display()),
@@ -1255,7 +1493,7 @@ fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> D
         format!("Build target     {}", BUILD_TARGET.unwrap_or("<unknown>")),
         format!("Git SHA          {}", GIT_SHA.unwrap_or("<unknown>")),
     ];
-    if let Some(model) = config.and_then(runtime::RuntimeConfig::model) {
+    if let Some(model) = default_model {
         details.push(format!("Default model    {model}"));
     }
     DiagnosticCheck::new(
@@ -1264,6 +1502,15 @@ fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> D
         "captured local runtime metadata",
     )
     .with_details(details)
+    .with_data(Map::from_iter([
+        ("os".to_string(), json!(env::consts::OS)),
+        ("arch".to_string(), json!(env::consts::ARCH)),
+        ("working_dir".to_string(), json!(cwd.display().to_string())),
+        ("version".to_string(), json!(VERSION)),
+        ("build_target".to_string(), json!(BUILD_TARGET)),
+        ("git_sha".to_string(), json!(GIT_SHA)),
+        ("default_model".to_string(), json!(default_model)),
+    ]))
 }
 
 fn resume_command_can_absorb_token(current_command: &str, token: &str) -> bool {
@@ -1373,8 +1620,13 @@ fn run_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::E
         println!("Listening for callback on {redirect_uri}");
     }
     if let Err(error) = open_browser(&authorize_url) {
-        eprintln!("warning: failed to open browser automatically: {error}");
-        println!("Open this URL manually:\n{authorize_url}");
+        emit_login_browser_open_failure(
+            output_format,
+            &authorize_url,
+            &error,
+            &mut io::stdout(),
+            &mut io::stderr(),
+        )?;
     }
 
     let callback = wait_for_oauth_callback(callback_port)?;
@@ -1423,6 +1675,23 @@ fn run_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::E
         ),
     }
     Ok(())
+}
+
+fn emit_login_browser_open_failure(
+    output_format: CliOutputFormat,
+    authorize_url: &str,
+    error: &io::Error,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> io::Result<()> {
+    writeln!(
+        stderr,
+        "warning: failed to open browser automatically: {error}"
+    )?;
+    match output_format {
+        CliOutputFormat::Text => writeln!(stdout, "Open this URL manually:\n{authorize_url}"),
+        CliOutputFormat::Json => writeln!(stderr, "Open this URL manually:\n{authorize_url}"),
+    }
 }
 
 fn run_logout(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
@@ -1520,21 +1789,23 @@ fn print_system_prompt(
 }
 
 fn print_version(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let report = render_version_report();
     match output_format {
-        CliOutputFormat::Text => println!("{report}"),
-        CliOutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "version",
-                "message": report,
-                "version": VERSION,
-                "git_sha": GIT_SHA,
-                "target": BUILD_TARGET,
-            }))?
-        ),
+        CliOutputFormat::Text => println!("{}", render_version_report()),
+        CliOutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&version_json_value())?);
+        }
     }
     Ok(())
+}
+
+fn version_json_value() -> serde_json::Value {
+    json!({
+        "kind": "version",
+        "message": render_version_report(),
+        "version": VERSION,
+        "git_sha": GIT_SHA,
+        "target": BUILD_TARGET,
+    })
 }
 
 fn resume_session(session_path: &Path, commands: &[String], output_format: CliOutputFormat) {
@@ -1584,38 +1855,21 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
             Ok(ResumeCommandOutcome {
                 session: next_session,
                 message,
+                json,
             }) => {
                 session = next_session;
-                if let Some(message) = message {
-                    if output_format == CliOutputFormat::Json
-                        && matches!(command, SlashCommand::Status)
-                    {
-                        let tracker = UsageTracker::from_session(&session);
-                        let usage = tracker.cumulative_usage();
-                        let context = status_context(Some(&resolved_path)).expect("status context");
-                        let value = json!({
-                            "kind": "status",
-                            "messages": session.messages.len(),
-                            "turns": tracker.turns(),
-                            "latest_total": tracker.current_turn_usage().total_tokens(),
-                            "cumulative_input": usage.input_tokens,
-                            "cumulative_output": usage.output_tokens,
-                            "cumulative_total": usage.total_tokens(),
-                            "workspace": {
-                                "cwd": context.cwd,
-                                "project_root": context.project_root,
-                                "git_branch": context.git_branch,
-                                "git_state": context.git_summary.headline(),
-                                "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
-                            }
-                        });
+                if output_format == CliOutputFormat::Json {
+                    if let Some(value) = json {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&value).expect("status json")
+                            serde_json::to_string_pretty(&value)
+                                .expect("resume command json output")
                         );
-                    } else {
+                    } else if let Some(message) = message {
                         println!("{message}");
                     }
+                } else if let Some(message) = message {
+                    println!("{message}");
                 }
             }
             Err(error) => {
@@ -1630,6 +1884,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
 struct ResumeCommandOutcome {
     session: Session,
     message: Option<String>,
+    json: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -1698,14 +1953,18 @@ impl GitWorkspaceSummary {
 #[cfg(test)]
 fn format_unknown_slash_command_message(name: &str) -> String {
     let suggestions = suggest_slash_commands(name);
-    if suggestions.is_empty() {
-        format!("unknown slash command: /{name}. Use /help to list available commands.")
-    } else {
-        format!(
-            "unknown slash command: /{name}. Did you mean {}? Use /help to list available commands.",
-            suggestions.join(", ")
-        )
+    let mut message = format!("unknown slash command: /{name}.");
+    if !suggestions.is_empty() {
+        message.push_str(" Did you mean ");
+        message.push_str(&suggestions.join(", "));
+        message.push('?');
     }
+    if let Some(note) = omc_compatibility_note_for_unknown_slash_command(name) {
+        message.push(' ');
+        message.push_str(note);
+    }
+    message.push_str(" Use /help to list available commands.");
+    message
 }
 
 fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
@@ -1964,6 +2223,7 @@ fn run_resume_command(
         SlashCommand::Help => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_repl_help()),
+            json: None,
         }),
         SlashCommand::Compact => {
             let result = runtime::compact_session(
@@ -1980,6 +2240,7 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: result.compacted_session,
                 message: Some(format_compact_report(removed, kept, skipped)),
+                json: None,
             })
         }
         SlashCommand::Clear { confirm } => {
@@ -1989,6 +2250,7 @@ fn run_resume_command(
                     message: Some(
                         "clear: confirmation required; rerun with /clear --confirm".to_string(),
                     ),
+                    json: None,
                 });
             }
             let backup_path = write_session_clear_backup(session, session_path)?;
@@ -2004,11 +2266,13 @@ fn run_resume_command(
                     backup_path.display(),
                     session_path.display()
                 )),
+                json: None,
             })
         }
         SlashCommand::Status => {
             let tracker = UsageTracker::from_session(session);
             let usage = tracker.cumulative_usage();
+            let context = status_context(Some(session_path))?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format_status_report(
@@ -2021,7 +2285,19 @@ fn run_resume_command(
                         estimated_tokens: 0,
                     },
                     default_permission_mode().as_str(),
-                    &status_context(Some(session_path))?,
+                    &context,
+                )),
+                json: Some(status_json_value(
+                    "restored-session",
+                    StatusUsage {
+                        message_count: session.messages.len(),
+                        turns: tracker.turns(),
+                        latest: tracker.current_turn_usage(),
+                        cumulative: usage,
+                        estimated_tokens: 0,
+                    },
+                    default_permission_mode().as_str(),
+                    &context,
                 )),
             })
         }
@@ -2029,12 +2305,11 @@ fn run_resume_command(
             let cwd = env::current_dir()?;
             let loader = ConfigLoader::default_for(&cwd);
             let runtime_config = loader.load()?;
+            let status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(format_sandbox_report(&resolve_sandbox_status(
-                    runtime_config.sandbox(),
-                    &cwd,
-                ))),
+                message: Some(format_sandbox_report(&status)),
+                json: Some(sandbox_json_value(&status)),
             })
         }
         SlashCommand::Cost => {
@@ -2042,11 +2317,13 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format_cost_report(usage)),
+                json: None,
             })
         }
         SlashCommand::Config { section } => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_config_report(section.as_deref())?),
+            json: None,
         }),
         SlashCommand::Mcp { action, target } => {
             let cwd = env::current_dir()?;
@@ -2059,25 +2336,33 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(handle_mcp_slash_command(args.as_deref(), &cwd)?),
+                json: Some(handle_mcp_slash_command_json(args.as_deref(), &cwd)?),
             })
         }
         SlashCommand::Memory => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_memory_report()?),
+            json: None,
         }),
-        SlashCommand::Init => Ok(ResumeCommandOutcome {
-            session: session.clone(),
-            message: Some(init_claude_md()?),
-        }),
+        SlashCommand::Init => {
+            let message = init_claude_md()?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message.clone()),
+                json: Some(init_json_value(&message)),
+            })
+        }
         SlashCommand::Diff => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_diff_report_for(
                 session_path.parent().unwrap_or_else(|| Path::new(".")),
             )?),
+            json: None,
         }),
         SlashCommand::Version => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_version_report()),
+            json: Some(version_json_value()),
         }),
         SlashCommand::Export { path } => {
             let export_path = resolve_export_path(path.as_deref(), session)?;
@@ -2089,6 +2374,7 @@ fn run_resume_command(
                     export_path.display(),
                     session.messages.len(),
                 )),
+                json: None,
             })
         }
         SlashCommand::Agents { args } => {
@@ -2096,18 +2382,26 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(handle_agents_slash_command(args.as_deref(), &cwd)?),
+                json: None,
             })
         }
         SlashCommand::Skills { args } => {
+            if let SkillSlashDispatch::Invoke(_) = classify_skills_slash_command(args.as_deref()) {
+                return Err(
+                    "resumed /skills invocations are interactive-only; start `claw` and run `/skills <skill>` in the REPL".into(),
+                );
+            }
             let cwd = env::current_dir()?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(handle_skills_slash_command(args.as_deref(), &cwd)?),
+                json: Some(handle_skills_slash_command_json(args.as_deref(), &cwd)?),
             })
         }
         SlashCommand::Doctor => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_doctor_report()?.render()),
+            json: None,
         }),
         SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
         SlashCommand::Bughunter { .. }
@@ -3033,7 +3327,12 @@ impl LiveCli {
                 false
             }
             SlashCommand::Skills { args } => {
-                Self::print_skills(args.as_deref(), CliOutputFormat::Text)?;
+                match classify_skills_slash_command(args.as_deref()) {
+                    SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
+                    SkillSlashDispatch::Local => {
+                        Self::print_skills(args.as_deref(), CliOutputFormat::Text)?;
+                    }
+                }
                 false
             }
             SlashCommand::Doctor => {
@@ -3316,16 +3615,11 @@ impl LiveCli {
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
-        let message = handle_agents_slash_command(args, &cwd)?;
         match output_format {
-            CliOutputFormat::Text => println!("{message}"),
+            CliOutputFormat::Text => println!("{}", handle_agents_slash_command(args, &cwd)?),
             CliOutputFormat::Json => println!(
                 "{}",
-                serde_json::to_string_pretty(&json!({
-                    "kind": "agents",
-                    "message": message,
-                    "args": args,
-                }))?
+                serde_json::to_string_pretty(&handle_agents_slash_command_json(args, &cwd)?)?
             ),
         }
         Ok(())
@@ -3356,6 +3650,32 @@ impl LiveCli {
             CliOutputFormat::Json => println!(
                 "{}",
                 serde_json::to_string_pretty(&handle_skills_slash_command_json(args, &cwd)?)?
+            ),
+        }
+        Ok(())
+    }
+
+    fn print_plugins(
+        action: Option<&str>,
+        target: Option<&str>,
+        output_format: CliOutputFormat,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
+        let loader = ConfigLoader::default_for(&cwd);
+        let runtime_config = loader.load()?;
+        let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+        let result = handle_plugins_slash_command(action, target, &mut manager)?;
+        match output_format {
+            CliOutputFormat::Text => println!("{}", result.message),
+            CliOutputFormat::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "plugin",
+                    "action": action.unwrap_or("list"),
+                    "target": target,
+                    "message": result.message,
+                    "reload_runtime": result.reload_runtime,
+                }))?
             ),
         }
         Ok(())
@@ -3880,52 +4200,66 @@ fn print_status_snapshot(
         ),
         CliOutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "status",
-                "model": model,
-                "permission_mode": permission_mode.as_str(),
-                "usage": {
-                    "messages": usage.message_count,
-                    "turns": usage.turns,
-                    "latest_total": usage.latest.total_tokens(),
-                    "cumulative_input": usage.cumulative.input_tokens,
-                    "cumulative_output": usage.cumulative.output_tokens,
-                    "cumulative_total": usage.cumulative.total_tokens(),
-                    "estimated_tokens": usage.estimated_tokens,
-                },
-                "workspace": {
-                    "cwd": context.cwd,
-                    "project_root": context.project_root,
-                    "git_branch": context.git_branch,
-                    "git_state": context.git_summary.headline(),
-                    "changed_files": context.git_summary.changed_files,
-                    "staged_files": context.git_summary.staged_files,
-                    "unstaged_files": context.git_summary.unstaged_files,
-                    "untracked_files": context.git_summary.untracked_files,
-                    "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
-                    "loaded_config_files": context.loaded_config_files,
-                    "discovered_config_files": context.discovered_config_files,
-                    "memory_file_count": context.memory_file_count,
-                },
-                "sandbox": {
-                    "enabled": context.sandbox_status.enabled,
-                    "active": context.sandbox_status.active,
-                    "supported": context.sandbox_status.supported,
-                    "in_container": context.sandbox_status.in_container,
-                    "requested_namespace": context.sandbox_status.requested.namespace_restrictions,
-                    "active_namespace": context.sandbox_status.namespace_active,
-                    "requested_network": context.sandbox_status.requested.network_isolation,
-                    "active_network": context.sandbox_status.network_active,
-                    "filesystem_mode": context.sandbox_status.filesystem_mode.as_str(),
-                    "filesystem_active": context.sandbox_status.filesystem_active,
-                    "allowed_mounts": context.sandbox_status.allowed_mounts,
-                    "markers": context.sandbox_status.container_markers,
-                    "fallback_reason": context.sandbox_status.fallback_reason,
-                }
-            }))?
+            serde_json::to_string_pretty(&status_json_value(
+                model,
+                usage,
+                permission_mode.as_str(),
+                &context,
+            ))?
         ),
     }
     Ok(())
+}
+
+fn status_json_value(
+    model: &str,
+    usage: StatusUsage,
+    permission_mode: &str,
+    context: &StatusContext,
+) -> serde_json::Value {
+    json!({
+        "kind": "status",
+        "model": model,
+        "permission_mode": permission_mode,
+        "usage": {
+            "messages": usage.message_count,
+            "turns": usage.turns,
+            "latest_total": usage.latest.total_tokens(),
+            "cumulative_input": usage.cumulative.input_tokens,
+            "cumulative_output": usage.cumulative.output_tokens,
+            "cumulative_total": usage.cumulative.total_tokens(),
+            "estimated_tokens": usage.estimated_tokens,
+        },
+        "workspace": {
+            "cwd": context.cwd,
+            "project_root": context.project_root,
+            "git_branch": context.git_branch,
+            "git_state": context.git_summary.headline(),
+            "changed_files": context.git_summary.changed_files,
+            "staged_files": context.git_summary.staged_files,
+            "unstaged_files": context.git_summary.unstaged_files,
+            "untracked_files": context.git_summary.untracked_files,
+            "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
+            "loaded_config_files": context.loaded_config_files,
+            "discovered_config_files": context.discovered_config_files,
+            "memory_file_count": context.memory_file_count,
+        },
+        "sandbox": {
+            "enabled": context.sandbox_status.enabled,
+            "active": context.sandbox_status.active,
+            "supported": context.sandbox_status.supported,
+            "in_container": context.sandbox_status.in_container,
+            "requested_namespace": context.sandbox_status.requested.namespace_restrictions,
+            "active_namespace": context.sandbox_status.namespace_active,
+            "requested_network": context.sandbox_status.requested.network_isolation,
+            "active_network": context.sandbox_status.network_active,
+            "filesystem_mode": context.sandbox_status.filesystem_mode.as_str(),
+            "filesystem_active": context.sandbox_status.filesystem_active,
+            "allowed_mounts": context.sandbox_status.allowed_mounts,
+            "markers": context.sandbox_status.container_markers,
+            "fallback_reason": context.sandbox_status.fallback_reason,
+        }
+    })
 }
 
 fn status_context(
@@ -4101,25 +4435,29 @@ fn print_sandbox_status_snapshot(
         CliOutputFormat::Text => println!("{}", format_sandbox_report(&status)),
         CliOutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "sandbox",
-                "enabled": status.enabled,
-                "active": status.active,
-                "supported": status.supported,
-                "in_container": status.in_container,
-                "requested_namespace": status.requested.namespace_restrictions,
-                "active_namespace": status.namespace_active,
-                "requested_network": status.requested.network_isolation,
-                "active_network": status.network_active,
-                "filesystem_mode": status.filesystem_mode.as_str(),
-                "filesystem_active": status.filesystem_active,
-                "allowed_mounts": status.allowed_mounts,
-                "markers": status.container_markers,
-                "fallback_reason": status.fallback_reason,
-            }))?
+            serde_json::to_string_pretty(&sandbox_json_value(&status))?
         ),
     }
     Ok(())
+}
+
+fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
+    json!({
+        "kind": "sandbox",
+        "enabled": status.enabled,
+        "active": status.active,
+        "supported": status.supported,
+        "in_container": status.in_container,
+        "requested_namespace": status.requested.namespace_restrictions,
+        "active_namespace": status.namespace_active,
+        "requested_network": status.requested.network_isolation,
+        "active_network": status.network_active,
+        "filesystem_mode": status.filesystem_mode.as_str(),
+        "filesystem_active": status.filesystem_active,
+        "allowed_mounts": status.allowed_mounts,
+        "markers": status.container_markers,
+        "fallback_reason": status.fallback_reason,
+    })
 }
 
 fn render_help_topic(topic: LocalHelpTopic) -> String {
@@ -4278,13 +4616,17 @@ fn run_init(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Er
         CliOutputFormat::Text => println!("{message}"),
         CliOutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "init",
-                "message": message,
-            }))?
+            serde_json::to_string_pretty(&init_json_value(&message))?
         ),
     }
     Ok(())
+}
+
+fn init_json_value(message: &str) -> serde_json::Value {
+    json!({
+        "kind": "init",
+        "message": message,
+    })
 }
 
 fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
@@ -5278,6 +5620,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: AnthropicClient,
+    session_id: String,
     model: String,
     enable_tools: bool,
     emit_output: bool,
@@ -5301,6 +5644,7 @@ impl AnthropicRuntimeClient {
             client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
                 .with_base_url(api::read_base_url())
                 .with_prompt_cache(PromptCache::new(session_id)),
+            session_id: session_id.to_string(),
             model,
             enable_tools,
             emit_output,
@@ -5312,13 +5656,29 @@ impl AnthropicRuntimeClient {
 }
 
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
-    Ok(resolve_startup_auth_source(|| {
-        let cwd = env::current_dir().map_err(api::ApiError::from)?;
-        let config = ConfigLoader::default_for(&cwd).load().map_err(|error| {
-            api::ApiError::Auth(format!("failed to load runtime OAuth config: {error}"))
-        })?;
-        Ok(config.oauth().cloned())
-    })?)
+    let cwd = env::current_dir()?;
+    Ok(resolve_cli_auth_source_for_cwd(&cwd, default_oauth_config)?)
+}
+
+fn resolve_cli_auth_source_for_cwd<F>(
+    cwd: &Path,
+    default_oauth: F,
+) -> Result<AuthSource, api::ApiError>
+where
+    F: FnOnce() -> OAuthConfig,
+{
+    resolve_startup_auth_source(|| {
+        Ok(Some(
+            load_runtime_oauth_config_for(cwd)?.unwrap_or_else(default_oauth),
+        ))
+    })
+}
+
+fn load_runtime_oauth_config_for(cwd: &Path) -> Result<Option<OAuthConfig>, api::ApiError> {
+    let config = ConfigLoader::default_for(cwd).load().map_err(|error| {
+        api::ApiError::Auth(format!("failed to load runtime OAuth config: {error}"))
+    })?;
+    Ok(config.oauth().cloned())
 }
 
 impl ApiClient for AnthropicRuntimeClient {
@@ -5340,11 +5700,13 @@ impl ApiClient for AnthropicRuntimeClient {
         };
 
         self.runtime.block_on(async {
-            let mut stream = self
-                .client
-                .stream_message(&message_request)
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let mut stream =
+                self.client
+                    .stream_message(&message_request)
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                    })?;
             let mut stdout = io::stdout();
             let mut sink = io::sink();
             let out: &mut dyn Write = if self.emit_output {
@@ -5356,17 +5718,23 @@ impl ApiClient for AnthropicRuntimeClient {
             let mut markdown_stream = MarkdownStreamState::default();
             let mut events = Vec::new();
             let mut pending_tool: Option<(String, String, String)> = None;
+            let mut block_has_thinking_summary = false;
             let mut saw_stop = false;
 
-            while let Some(event) = stream
-                .next_event()
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?
-            {
+            while let Some(event) = stream.next_event().await.map_err(|error| {
+                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+            })? {
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
                         for block in start.message.content {
-                            push_output_block(block, out, &mut events, &mut pending_tool, true)?;
+                            push_output_block(
+                                block,
+                                out,
+                                &mut events,
+                                &mut pending_tool,
+                                true,
+                                &mut block_has_thinking_summary,
+                            )?;
                         }
                     }
                     ApiStreamEvent::ContentBlockStart(start) => {
@@ -5376,6 +5744,7 @@ impl ApiClient for AnthropicRuntimeClient {
                             &mut events,
                             &mut pending_tool,
                             true,
+                            &mut block_has_thinking_summary,
                         )?;
                     }
                     ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
@@ -5397,10 +5766,16 @@ impl ApiClient for AnthropicRuntimeClient {
                                 input.push_str(&partial_json);
                             }
                         }
-                        ContentBlockDelta::ThinkingDelta { .. }
-                        | ContentBlockDelta::SignatureDelta { .. } => {}
+                        ContentBlockDelta::ThinkingDelta { .. } => {
+                            if !block_has_thinking_summary {
+                                render_thinking_block_summary(out, None, false)?;
+                                block_has_thinking_summary = true;
+                            }
+                        }
+                        ContentBlockDelta::SignatureDelta { .. } => {}
                     },
                     ApiStreamEvent::ContentBlockStop(_) => {
+                        block_has_thinking_summary = false;
                         if let Some(rendered) = markdown_stream.flush(&renderer) {
                             write!(out, "{rendered}")
                                 .and_then(|()| out.flush())
@@ -5457,7 +5832,9 @@ impl ApiClient for AnthropicRuntimeClient {
                     ..message_request.clone()
                 })
                 .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                .map_err(|error| {
+                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                })?;
             let mut events = response_to_events(response, out)?;
             push_prompt_cache_record(&self.client, &mut events);
             Ok(events)
@@ -5538,6 +5915,7 @@ impl ApiClient for ProviderBackedRuntimeClient {
             let mut markdown_stream = MarkdownStreamState::default();
             let mut events = Vec::new();
             let mut pending_tool: Option<(String, String, String)> = None;
+            let mut block_has_thinking_summary = false;
             let mut saw_stop = false;
 
             while let Some(event) = stream
@@ -5548,7 +5926,14 @@ impl ApiClient for ProviderBackedRuntimeClient {
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
                         for block in start.message.content {
-                            push_output_block(block, out, &mut events, &mut pending_tool, true)?;
+                            push_output_block(
+                                block,
+                                out,
+                                &mut events,
+                                &mut pending_tool,
+                                true,
+                                &mut block_has_thinking_summary,
+                            )?;
                         }
                     }
                     ApiStreamEvent::ContentBlockStart(start) => {
@@ -5558,6 +5943,7 @@ impl ApiClient for ProviderBackedRuntimeClient {
                             &mut events,
                             &mut pending_tool,
                             true,
+                            &mut block_has_thinking_summary,
                         )?;
                     }
                     ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
@@ -5576,10 +5962,16 @@ impl ApiClient for ProviderBackedRuntimeClient {
                                 input.push_str(&partial_json);
                             }
                         }
-                        ContentBlockDelta::ThinkingDelta { .. }
-                        | ContentBlockDelta::SignatureDelta { .. } => {}
+                        ContentBlockDelta::ThinkingDelta { .. } => {
+                            if !block_has_thinking_summary {
+                                render_thinking_block_summary(out, None, false)?;
+                                block_has_thinking_summary = true;
+                            }
+                        }
+                        ContentBlockDelta::SignatureDelta { .. } => {}
                     },
                     ApiStreamEvent::ContentBlockStop(_) => {
+                        block_has_thinking_summary = false;
                         if let Some(rendered) = markdown_stream.flush(&renderer) {
                             write!(out, "{rendered}")
                                 .and_then(|()| out.flush())
@@ -5638,6 +6030,91 @@ impl ApiClient for ProviderBackedRuntimeClient {
             Ok(events)
         })
     }
+}
+
+fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
+    if error.is_context_window_failure() {
+        format_context_window_blocked_error(session_id, error)
+    } else if error.is_generic_fatal_wrapper() {
+        let mut qualifiers = vec![format!("session {session_id}")];
+        if let Some(request_id) = error.request_id() {
+            qualifiers.push(format!("trace {request_id}"));
+        }
+        format!(
+            "{} ({}): {}",
+            error.safe_failure_class(),
+            qualifiers.join(", "),
+            error
+        )
+    } else {
+        error.to_string()
+    }
+}
+
+fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) -> String {
+    let mut lines = vec![
+        "Context window blocked".to_string(),
+        "  Failure class    context_window_blocked".to_string(),
+        format!("  Session          {session_id}"),
+    ];
+
+    if let Some(request_id) = error.request_id() {
+        lines.push(format!("  Trace            {request_id}"));
+    }
+
+    match error {
+        api::ApiError::ContextWindowExceeded {
+            model,
+            estimated_input_tokens,
+            requested_output_tokens,
+            estimated_total_tokens,
+            context_window_tokens,
+        } => {
+            lines.push(format!("  Model            {model}"));
+            lines.push(format!("  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"));
+            lines.push(format!("  Requested output {requested_output_tokens} tokens"));
+            lines.push(format!("  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"));
+            lines.push(format!("  Context window   {context_window_tokens} tokens"));
+        }
+        api::ApiError::Api { message, body, .. } => {
+            let detail = message.as_deref().unwrap_or(body).trim();
+            if !detail.is_empty() {
+                lines.push(format!(
+                    "  Detail           {}",
+                    truncate_for_summary(detail, 120)
+                ));
+            }
+        }
+        api::ApiError::RetriesExhausted { last_error, .. } => {
+            let detail = match last_error.as_ref() {
+                api::ApiError::Api { message, body, .. } => message.as_deref().unwrap_or(body),
+                other => return format_context_window_blocked_error(session_id, other),
+            }
+            .trim();
+            if !detail.is_empty() {
+                lines.push(format!(
+                    "  Detail           {}",
+                    truncate_for_summary(detail, 120)
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    lines.push(String::new());
+    lines.push("Recovery".to_string());
+    lines.push("  Compact          /compact".to_string());
+    lines.push(format!(
+        "  Resume compact   claw --resume {session_id} /compact"
+    ));
+    lines.push("  Fresh session    /clear --confirm".to_string());
+    lines.push(
+        "  Reduce scope     remove large pasted context/files or ask for a smaller slice"
+            .to_string(),
+    );
+    lines.push("  Retry            rerun after compacting or reducing the request".to_string());
+
+    lines.join("\n")
 }
 
 fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
@@ -6223,12 +6700,30 @@ fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: usize
     preview
 }
 
+fn render_thinking_block_summary(
+    out: &mut (impl Write + ?Sized),
+    char_count: Option<usize>,
+    redacted: bool,
+) -> Result<(), RuntimeError> {
+    let summary = if redacted {
+        "\n▶ Thinking block hidden by provider\n".to_string()
+    } else if let Some(char_count) = char_count {
+        format!("\n▶ Thinking ({char_count} chars hidden)\n")
+    } else {
+        "\n▶ Thinking hidden\n".to_string()
+    };
+    write!(out, "{summary}")
+        .and_then(|()| out.flush())
+        .map_err(|error| RuntimeError::new(error.to_string()))
+}
+
 fn push_output_block(
     block: OutputContentBlock,
     out: &mut (impl Write + ?Sized),
     events: &mut Vec<AssistantEvent>,
     pending_tool: &mut Option<(String, String, String)>,
     streaming_tool_input: bool,
+    block_has_thinking_summary: &mut bool,
 ) -> Result<(), RuntimeError> {
     match block {
         OutputContentBlock::Text { text } => {
@@ -6254,7 +6749,14 @@ fn push_output_block(
             };
             *pending_tool = Some((id, name, initial_input));
         }
-        OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
+        OutputContentBlock::Thinking { thinking, .. } => {
+            render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
+            *block_has_thinking_summary = true;
+        }
+        OutputContentBlock::RedactedThinking { .. } => {
+            render_thinking_block_summary(out, None, true)?;
+            *block_has_thinking_summary = true;
+        }
     }
     Ok(())
 }
@@ -6267,7 +6769,15 @@ fn response_to_events(
     let mut pending_tool = None;
 
     for block in response.content {
-        push_output_block(block, out, &mut events, &mut pending_tool, false)?;
+        let mut block_has_thinking_summary = false;
+        push_output_block(
+            block,
+            out,
+            &mut events,
+            &mut pending_tool,
+            false,
+            &mut block_has_thinking_summary,
+        )?;
         if let Some((id, name, input)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse { id, name, input });
         }
@@ -6646,30 +7156,34 @@ mod tests {
         format_permissions_report, format_permissions_switch_report, format_pr_report,
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, normalize_permission_mode, parse_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        permission_policy, print_help_to, push_output_block, render_config_report,
-        render_diff_report, render_diff_report_for, render_memory_report, render_repl_help,
-        render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
+        format_unknown_slash_command_message, format_user_visible_api_error,
+        normalize_permission_mode, parse_args, parse_git_status_branch,
+        parse_git_status_metadata_for, parse_git_workspace_summary, permission_policy,
+        print_help_to, push_output_block, render_config_report, render_diff_report,
+        render_diff_report_for, render_memory_report, render_repl_help, render_resume_usage,
+        resolve_model_alias, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
         SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
-    use api::{MessageResponse, OutputContentBlock, Usage};
+    use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
     use runtime::{
-        AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, MessageRole,
-        PermissionMode, Session, ToolExecutor,
+        load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
+        ConversationMessage, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
     };
     use serde_json::json;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
 
@@ -6697,12 +7211,166 @@ mod tests {
         .expect("plugin tool registry should build")
     }
 
+    #[test]
+    fn opaque_provider_wrapper_surfaces_failure_class_session_and_trace() {
+        let error = ApiError::Api {
+            status: "500".parse().expect("status"),
+            error_type: Some("api_error".to_string()),
+            message: Some(
+                "Something went wrong while processing your request. Please try again, or use /new to start a fresh session."
+                    .to_string(),
+            ),
+            request_id: Some("req_jobdori_789".to_string()),
+            body: String::new(),
+            retryable: true,
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-22", &error);
+        assert!(rendered.contains("provider_internal"));
+        assert!(rendered.contains("session session-issue-22"));
+        assert!(rendered.contains("trace req_jobdori_789"));
+    }
+
+    #[test]
+    fn retry_exhaustion_uses_retry_failure_class_for_generic_provider_wrapper() {
+        let error = ApiError::RetriesExhausted {
+            attempts: 3,
+            last_error: Box::new(ApiError::Api {
+                status: "502".parse().expect("status"),
+                error_type: Some("api_error".to_string()),
+                message: Some(
+                    "Something went wrong while processing your request. Please try again, or use /new to start a fresh session."
+                        .to_string(),
+                ),
+                request_id: Some("req_jobdori_790".to_string()),
+                body: String::new(),
+                retryable: true,
+            }),
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-22", &error);
+        assert!(rendered.contains("provider_retry_exhausted"), "{rendered}");
+        assert!(rendered.contains("session session-issue-22"));
+        assert!(rendered.contains("trace req_jobdori_790"));
+    }
+
+    #[test]
+    fn context_window_preflight_errors_render_recovery_steps() {
+        let error = ApiError::ContextWindowExceeded {
+            model: "claude-sonnet-4-6".to_string(),
+            estimated_input_tokens: 182_000,
+            requested_output_tokens: 64_000,
+            estimated_total_tokens: 246_000,
+            context_window_tokens: 200_000,
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-32", &error);
+        assert!(rendered.contains("Context window blocked"), "{rendered}");
+        assert!(rendered.contains("context_window_blocked"), "{rendered}");
+        assert!(
+            rendered.contains("Session          session-issue-32"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Model            claude-sonnet-4-6"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Input estimate   ~182000 tokens (heuristic)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Total estimate   ~246000 tokens (heuristic)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Compact          /compact"), "{rendered}");
+        assert!(
+            rendered.contains("Resume compact   claw --resume session-issue-32 /compact"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Fresh session    /clear --confirm"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Reduce scope"), "{rendered}");
+        assert!(rendered.contains("Retry            rerun"), "{rendered}");
+    }
+
+    #[test]
+    fn provider_context_window_errors_are_reframed_with_same_guidance() {
+        let error = ApiError::Api {
+            status: "400".parse().expect("status"),
+            error_type: Some("invalid_request_error".to_string()),
+            message: Some(
+                "This model's maximum context length is 200000 tokens, but your request used 230000 tokens."
+                    .to_string(),
+            ),
+            request_id: Some("req_ctx_456".to_string()),
+            body: String::new(),
+            retryable: false,
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-32", &error);
+        assert!(rendered.contains("context_window_blocked"), "{rendered}");
+        assert!(
+            rendered.contains("Trace            req_ctx_456"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("Detail           This model's maximum context length is 200000 tokens"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Compact          /compact"), "{rendered}");
+        assert!(
+            rendered.contains("Fresh session    /clear --confirm"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn retry_wrapped_context_window_errors_keep_recovery_guidance() {
+        let error = ApiError::RetriesExhausted {
+            attempts: 2,
+            last_error: Box::new(ApiError::Api {
+                status: "413".parse().expect("status"),
+                error_type: Some("invalid_request_error".to_string()),
+                message: Some("Request is too large for this model's context window.".to_string()),
+                request_id: Some("req_ctx_retry_789".to_string()),
+                body: String::new(),
+                retryable: false,
+            }),
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-32", &error);
+        assert!(rendered.contains("Context window blocked"), "{rendered}");
+        assert!(rendered.contains("context_window_blocked"), "{rendered}");
+        assert!(
+            rendered.contains("Trace            req_ctx_retry_789"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("Detail           Request is too large for this model's context window."),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Compact          /compact"), "{rendered}");
+        assert!(
+            rendered.contains("Resume compact   claw --resume session-issue-32 /compact"),
+            "{rendered}"
+        );
+    }
+
     fn temp_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("rusty-claude-cli-{nanos}"))
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("rusty-claude-cli-{nanos}-{unique}"))
     }
 
     fn git(args: &[&str], cwd: &Path) {
@@ -6723,6 +7391,36 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn sample_oauth_config(token_url: String) -> OAuthConfig {
+        OAuthConfig {
+            client_id: "runtime-client".to_string(),
+            authorize_url: "https://console.test/oauth/authorize".to_string(),
+            token_url,
+            callback_port: Some(4545),
+            manual_redirect_url: Some("https://console.test/oauth/callback".to_string()),
+            scopes: vec!["org:create_api_key".to_string(), "user:profile".to_string()],
+        }
+    }
+
+    fn spawn_token_server(response_body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).expect("read request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+        format!("http://{address}/oauth/token")
     }
 
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
@@ -6861,6 +7559,78 @@ mod tests {
         std::fs::remove_dir_all(root).expect("temp config root should clean up");
 
         assert_eq!(resolved, PermissionMode::ReadOnly);
+    }
+
+    #[test]
+    fn load_runtime_oauth_config_for_returns_none_without_project_config() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        std::fs::create_dir_all(&root).expect("workspace should exist");
+
+        let oauth = super::load_runtime_oauth_config_for(&root)
+            .expect("loading config should succeed when files are absent");
+
+        std::fs::remove_dir_all(root).expect("temp workspace should clean up");
+
+        assert_eq!(oauth, None);
+    }
+
+    #[test]
+    fn resolve_cli_auth_source_uses_default_oauth_when_runtime_config_is_missing() {
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        let config_home = temp_dir();
+        std::fs::create_dir_all(&workspace).expect("workspace should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        let original_auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+
+        save_oauth_credentials(&runtime::OAuthTokenSet {
+            access_token: "expired-access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            expires_at: Some(0),
+            scopes: vec!["org:create_api_key".to_string(), "user:profile".to_string()],
+        })
+        .expect("save expired oauth credentials");
+
+        let token_url = spawn_token_server(
+            r#"{"access_token":"refreshed-access-token","refresh_token":"refreshed-refresh-token","expires_at":4102444800,"scopes":["org:create_api_key","user:profile"]}"#,
+        );
+
+        let auth =
+            super::resolve_cli_auth_source_for_cwd(&workspace, || sample_oauth_config(token_url))
+                .expect("expired saved oauth should refresh via default config");
+
+        let stored = load_oauth_credentials()
+            .expect("load stored credentials")
+            .expect("stored credentials should exist");
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_api_key {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        match original_auth_token {
+            Some(value) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", value),
+            None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
+        }
+        std::fs::remove_dir_all(workspace).expect("temp workspace should clean up");
+        std::fs::remove_dir_all(config_home).expect("temp config home should clean up");
+
+        assert_eq!(auth.bearer_token(), Some("refreshed-access-token"));
+        assert_eq!(stored.access_token, "refreshed-access-token");
+        assert_eq!(
+            stored.refresh_token.as_deref(),
+            Some("refreshed-refresh-token")
+        );
     }
 
     #[test]
@@ -7064,6 +7834,21 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&[
+                "skills".to_string(),
+                "help".to_string(),
+                "overview".to_string()
+            ])
+            .expect("skills help overview should invoke"),
+            CliAction::Prompt {
+                prompt: "$help overview".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: crate::default_permission_mode(),
+            }
+        );
+        assert_eq!(
             parse_args(&["agents".to_string(), "--help".to_string()])
                 .expect("agents help should parse"),
             CliAction::Agents {
@@ -7197,11 +7982,41 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&["/skill".to_string()]).expect("/skill should parse"),
+            CliAction::Skills {
+                args: None,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
             parse_args(&["/skills".to_string(), "help".to_string()])
                 .expect("/skills help should parse"),
             CliAction::Skills {
                 args: Some("help".to_string()),
                 output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["/skill".to_string(), "list".to_string()])
+                .expect("/skill list should parse"),
+            CliAction::Skills {
+                args: Some("list".to_string()),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "/skills".to_string(),
+                "help".to_string(),
+                "overview".to_string()
+            ])
+            .expect("/skills help overview should invoke"),
+            CliAction::Prompt {
+                prompt: "$help overview".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: crate::default_permission_mode(),
             }
         );
         assert_eq!(
@@ -7214,6 +8029,17 @@ mod tests {
             CliAction::Skills {
                 args: Some("install ./fixtures/help-skill".to_string()),
                 output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["/skills".to_string(), "/test".to_string()])
+                .expect("/skills /test should normalize to a single skill prompt prefix"),
+            CliAction::Prompt {
+                prompt: "$test".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: crate::default_permission_mode(),
             }
         );
         let error = parse_args(&["/status".to_string()])
@@ -7245,6 +8071,16 @@ mod tests {
         assert!(report.contains("unknown slash command: /statsu"));
         assert!(report.contains("Did you mean"));
         assert!(report.contains("Use /help"));
+    }
+
+    #[test]
+    fn formats_namespaced_omc_slash_command_with_contract_guidance() {
+        let report = format_unknown_slash_command_message("oh-my-claudecode:hud");
+        assert!(report.contains("unknown slash command: /oh-my-claudecode:hud"));
+        assert!(report.contains("Claude Code/OMC plugin command"));
+        assert!(report.contains("plugin slash commands"));
+        assert!(report.contains("statusline"));
+        assert!(report.contains("session hooks"));
     }
 
     #[test]
@@ -8045,6 +8881,14 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn unknown_omc_slash_command_guidance_explains_runtime_gap() {
+        let message = format_unknown_slash_command("oh-my-claudecode:hud");
+        assert!(message.contains("Unknown slash command: /oh-my-claudecode:hud"));
+        assert!(message.contains("Claude Code/OMC plugin command"));
+        assert!(message.contains("does not yet load plugin slash commands"));
+    }
+
+    #[test]
     fn resume_usage_mentions_latest_shortcut() {
         let usage = render_resume_usage();
         assert!(usage.contains("/resume <session-path|session-id|latest>"));
@@ -8280,6 +9124,7 @@ UU conflicted.rs",
         let mut out = Vec::new();
         let mut events = Vec::new();
         let mut pending_tool = None;
+        let mut block_has_thinking_summary = false;
 
         push_output_block(
             OutputContentBlock::Text {
@@ -8289,6 +9134,7 @@ UU conflicted.rs",
             &mut events,
             &mut pending_tool,
             false,
+            &mut block_has_thinking_summary,
         )
         .expect("text block should render");
 
@@ -8302,6 +9148,7 @@ UU conflicted.rs",
         let mut out = Vec::new();
         let mut events = Vec::new();
         let mut pending_tool = None;
+        let mut block_has_thinking_summary = false;
 
         push_output_block(
             OutputContentBlock::ToolUse {
@@ -8313,6 +9160,7 @@ UU conflicted.rs",
             &mut events,
             &mut pending_tool,
             true,
+            &mut block_has_thinking_summary,
         )
         .expect("tool block should accumulate");
 
@@ -8394,7 +9242,7 @@ UU conflicted.rs",
     }
 
     #[test]
-    fn response_to_events_ignores_thinking_blocks() {
+    fn response_to_events_renders_collapsed_thinking_summary() {
         let mut out = Vec::new();
         let events = response_to_events(
             MessageResponse {
@@ -8429,7 +9277,34 @@ UU conflicted.rs",
             &events[0],
             AssistantEvent::TextDelta(text) if text == "Final answer"
         ));
-        assert!(!String::from_utf8(out).expect("utf8").contains("step 1"));
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(rendered.contains("▶ Thinking (6 chars hidden)"));
+        assert!(!rendered.contains("step 1"));
+    }
+
+    #[test]
+    fn login_browser_failure_keeps_json_stdout_clean() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let error = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no supported browser opener command found",
+        );
+
+        super::emit_login_browser_open_failure(
+            CliOutputFormat::Json,
+            "https://example.test/oauth/authorize",
+            &error,
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("browser warning should render");
+
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).expect("utf8");
+        assert!(stderr.contains("failed to open browser automatically"));
+        assert!(stderr.contains("Open this URL manually:"));
+        assert!(stderr.contains("https://example.test/oauth/authorize"));
     }
 
     #[test]

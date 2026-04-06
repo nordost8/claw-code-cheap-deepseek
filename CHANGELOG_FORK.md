@@ -27,4 +27,11 @@ Track **your** releases on top of **upstream** Claw Code.
 - Tests: `cargo test --workspace` (run after build)
 - Notes: conflicts in `README.md`, `mod.rs`, `main.rs`
 
+### 2026-04-06 — sync upstream (Anthropic count_tokens preflight)
+
+- Upstream: `instructkr/claw-code` @ `be561bfdeb92fce7011938e748ee20051460d6a4` (`upstream/main` at fetch time)
+- Fork changes: resolved `rust/crates/rusty-claude-cli/src/main.rs` — kept `ProviderBackedRuntimeClient` + upstream `format_user_visible_api_error` / `format_context_window_blocked_error`; updated `push_output_block` calls for thinking summary; `rust/crates/api/tests/client_integration.rs` + `mock_parity_harness.rs` — expect `POST /v1/messages/count_tokens` preflight (integration test + mock parity harness)
+- Tests: `cargo test --workspace`
+- Notes: conflict in `main.rs` around provider runtime vs error helpers
+
 - _Add entries after each `merge`/`rebase` from `upstream/main`._
