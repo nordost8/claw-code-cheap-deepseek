@@ -11,7 +11,6 @@ pub enum ProviderClient {
     Anthropic(AnthropicClient),
     Xai(OpenAiCompatClient),
     OpenAi(OpenAiCompatClient),
-    DeepSeek(OpenAiCompatClient),
 }
 
 impl ProviderClient {
@@ -32,12 +31,33 @@ impl ProviderClient {
             ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
                 OpenAiCompatConfig::xai(),
             )?)),
-            ProviderKind::OpenAi => Ok(Self::OpenAi(OpenAiCompatClient::from_env(
-                providers::openai_compat_config_for_model(&resolved_model),
-            )?)),
-            ProviderKind::DeepSeek => Ok(Self::DeepSeek(OpenAiCompatClient::from_env(
-                openai_compat::OpenAiCompatConfig::deepseek(),
-            )?)),
+            ProviderKind::OpenAi => {
+                // DashScope (qwen-*) and DeepSeek use OpenAI wire format but different base URLs / keys.
+                let config = match providers::metadata_for_model(&resolved_model) {
+                    Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
+                        OpenAiCompatConfig::dashscope()
+                    }
+                    Some(meta) if meta.auth_env == "DEEPSEEK_API_KEY" => {
+                        OpenAiCompatConfig::deepseek()
+                    }
+                    _ => {
+                        let c = providers::resolve_model_alias(&resolved_model);
+                        if matches!(
+                            c.as_str(),
+                            "deepseek-chat" | "deepseek-reasoner"
+                        ) {
+                            OpenAiCompatConfig::deepseek()
+                        } else if openai_compat::has_api_key("DEEPSEEK_API_KEY")
+                            && !openai_compat::has_api_key("OPENAI_API_KEY")
+                        {
+                            OpenAiCompatConfig::deepseek()
+                        } else {
+                            OpenAiCompatConfig::openai()
+                        }
+                    }
+                };
+                Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
+            }
         }
     }
 
@@ -47,7 +67,6 @@ impl ProviderClient {
             Self::Anthropic(_) => ProviderKind::Anthropic,
             Self::Xai(_) => ProviderKind::Xai,
             Self::OpenAi(_) => ProviderKind::OpenAi,
-            Self::DeepSeek(_) => ProviderKind::DeepSeek,
         }
     }
 
@@ -63,7 +82,7 @@ impl ProviderClient {
     pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
         match self {
             Self::Anthropic(client) => client.prompt_cache_stats(),
-            Self::Xai(_) | Self::OpenAi(_) | Self::DeepSeek(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) => None,
         }
     }
 
@@ -71,7 +90,7 @@ impl ProviderClient {
     pub fn take_last_prompt_cache_record(&self) -> Option<PromptCacheRecord> {
         match self {
             Self::Anthropic(client) => client.take_last_prompt_cache_record(),
-            Self::Xai(_) | Self::OpenAi(_) | Self::DeepSeek(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) => None,
         }
     }
 
@@ -81,9 +100,7 @@ impl ProviderClient {
     ) -> Result<MessageResponse, ApiError> {
         match self {
             Self::Anthropic(client) => client.send_message(request).await,
-            Self::Xai(client) | Self::OpenAi(client) | Self::DeepSeek(client) => {
-                client.send_message(request).await
-            }
+            Self::Xai(client) | Self::OpenAi(client) => client.send_message(request).await,
         }
     }
 
@@ -96,7 +113,7 @@ impl ProviderClient {
                 .stream_message(request)
                 .await
                 .map(MessageStream::Anthropic),
-            Self::Xai(client) | Self::OpenAi(client) | Self::DeepSeek(client) => client
+            Self::Xai(client) | Self::OpenAi(client) => client
                 .stream_message(request)
                 .await
                 .map(MessageStream::OpenAiCompat),
@@ -142,7 +159,20 @@ pub fn read_xai_base_url() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
+    use super::ProviderClient;
     use crate::providers::{detect_provider_kind, resolve_model_alias, ProviderKind};
+
+    /// Serializes every test in this module that mutates process-wide
+    /// environment variables so concurrent test threads cannot observe
+    /// each other's partially-applied state.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn resolves_existing_and_grok_aliases() {
@@ -158,5 +188,69 @@ mod tests {
             detect_provider_kind("claude-sonnet-4-6"),
             ProviderKind::Anthropic
         );
+    }
+
+    /// Snapshot-restore guard for a single environment variable. Mirrors
+    /// the pattern used in `providers/mod.rs` tests: captures the original
+    /// value on construction, applies the override, and restores on drop so
+    /// tests leave the process env untouched even when they panic.
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var_os(key);
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn dashscope_model_uses_dashscope_config_not_openai() {
+        // Regression: qwen-plus was being routed to OpenAiCompatConfig::openai()
+        // which reads OPENAI_API_KEY and points at api.openai.com, when it should
+        // use OpenAiCompatConfig::dashscope() which reads DASHSCOPE_API_KEY and
+        // points at dashscope.aliyuncs.com.
+        let _lock = env_lock();
+        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", Some("test-dashscope-key"));
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+
+        let client = ProviderClient::from_model("qwen-plus");
+
+        // Must succeed (not fail with "missing OPENAI_API_KEY")
+        assert!(
+            client.is_ok(),
+            "qwen-plus with DASHSCOPE_API_KEY set should build successfully, got: {:?}",
+            client.err()
+        );
+
+        // Verify it's the OpenAi variant pointed at the DashScope base URL.
+        match client.unwrap() {
+            ProviderClient::OpenAi(openai_client) => {
+                assert!(
+                    openai_client.base_url().contains("dashscope.aliyuncs.com"),
+                    "qwen-plus should route to DashScope base URL (contains 'dashscope.aliyuncs.com'), got: {}",
+                    openai_client.base_url()
+                );
+            }
+            other => panic!(
+                "Expected ProviderClient::OpenAi for qwen-plus, got: {:?}",
+                other
+            ),
+        }
     }
 }

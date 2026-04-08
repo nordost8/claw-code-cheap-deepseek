@@ -4,8 +4,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, resolve_model_alias, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
+    max_tokens_for_model, resolve_model_alias, ApiError, ContentBlockDelta, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
@@ -22,10 +22,11 @@ use runtime::{
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
-    BranchFreshness, ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput,
-    LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus,
-    LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode, PermissionPolicy,
-    PromptCacheEvent, RuntimeError, Session, TaskPacket, ToolError, ToolExecutor,
+    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
+    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
+    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
+    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket,
+    ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -963,6 +964,21 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
+            name: "WorkerObserveCompletion",
+            description: "Report session completion to the worker, classifying finish_reason into Finished or Failed (provider-degraded). Use after the opencode session completes to advance the worker to its terminal state.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "worker_id": { "type": "string" },
+                    "finish_reason": { "type": "string" },
+                    "tokens_output": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["worker_id", "finish_reason", "tokens_output"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
             name: "TeamCreate",
             description: "Create a team of sub-agents for parallel task execution.",
             input_schema: json!({
@@ -1228,6 +1244,8 @@ fn execute_tool_with_enforcer(
         }
         "WorkerRestart" => from_value::<WorkerIdInput>(input).and_then(run_worker_restart),
         "WorkerTerminate" => from_value::<WorkerIdInput>(input).and_then(run_worker_terminate),
+        "WorkerObserveCompletion" => from_value::<WorkerObserveCompletionInput>(input)
+            .and_then(run_worker_observe_completion),
         "TeamCreate" => from_value::<TeamCreateInput>(input).and_then(run_team_create),
         "TeamDelete" => from_value::<TeamDeleteInput>(input).and_then(run_team_delete),
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
@@ -1426,9 +1444,20 @@ fn run_task_output(input: TaskIdInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_worker_create(input: WorkerCreateInput) -> Result<String, String> {
+    // Merge config-level trusted_roots with per-call overrides.
+    // Config provides the default allowlist; per-call roots add on top.
+    let config_roots: Vec<String> = ConfigLoader::default_for(&input.cwd)
+        .load()
+        .ok()
+        .map(|c| c.trusted_roots().to_vec())
+        .unwrap_or_default();
+    let merged_roots: Vec<String> = config_roots
+        .into_iter()
+        .chain(input.trusted_roots.iter().cloned())
+        .collect();
     let worker = global_worker_registry().create(
         &input.cwd,
-        &input.trusted_roots,
+        &merged_roots,
         input.auto_recover_prompt_misdelivery,
     );
     to_pretty_json(worker)
@@ -1475,6 +1504,16 @@ fn run_worker_restart(input: WorkerIdInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_worker_terminate(input: WorkerIdInput) -> Result<String, String> {
     let worker = global_worker_registry().terminate(&input.worker_id)?;
+    to_pretty_json(worker)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_worker_observe_completion(input: WorkerObserveCompletionInput) -> Result<String, String> {
+    let worker = global_worker_registry().observe_completion(
+        &input.worker_id,
+        &input.finish_reason,
+        input.tokens_output,
+    )?;
     to_pretty_json(worker)
 }
 
@@ -2210,6 +2249,13 @@ struct WorkerCreateInput {
 #[derive(Debug, Deserialize)]
 struct WorkerIdInput {
     worker_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerObserveCompletionInput {
+    worker_id: String,
+    finish_reason: String,
+    tokens_output: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3699,29 +3745,73 @@ fn classify_lane_failure(error: &str) -> LaneFailureClass {
     }
 }
 
+struct ProviderEntry {
+    model: String,
+    client: ProviderClient,
+}
+
 struct ProviderRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: ProviderClient,
-    model: String,
+    chain: Vec<ProviderEntry>,
     allowed_tools: BTreeSet<String>,
 }
 
 impl ProviderRuntimeClient {
     #[allow(clippy::needless_pass_by_value)]
     fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
-        let model = resolve_model_alias(&model).clone();
-        let client = ProviderClient::from_model(&model).map_err(|error| error.to_string())?;
+        let fallback_config = load_provider_fallback_config();
+        Self::new_with_fallback_config(model, allowed_tools, &fallback_config)
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn new_with_fallback_config(
+        model: String,
+        allowed_tools: BTreeSet<String>,
+        fallback_config: &ProviderFallbackConfig,
+    ) -> Result<Self, String> {
+        let primary_model = fallback_config
+            .primary()
+            .map(str::to_string)
+            .unwrap_or(model);
+        let primary = build_provider_entry(&primary_model)?;
+        let mut chain = vec![primary];
+        for fallback_model in fallback_config.fallbacks() {
+            match build_provider_entry(fallback_model) {
+                Ok(entry) => chain.push(entry),
+                Err(error) => {
+                    eprintln!(
+                        "warning: skipping unavailable fallback provider {fallback_model}: {error}"
+                    );
+                }
+            }
+        }
         Ok(Self {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
-            client,
-            model,
+            chain,
             allowed_tools,
         })
     }
 }
 
+fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
+    let resolved = resolve_model_alias(model).clone();
+    let client = ProviderClient::from_model(&resolved).map_err(|error| error.to_string())?;
+    Ok(ProviderEntry {
+        model: resolved,
+        client,
+    })
+}
+
+fn load_provider_fallback_config() -> ProviderFallbackConfig {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(cwd).load().ok())
+        .map_or_else(ProviderFallbackConfig::default, |config| {
+            config.provider_fallbacks().clone()
+        })
+}
+
 impl ApiClient for ProviderRuntimeClient {
-    #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
             .into_iter()
@@ -3731,106 +3821,131 @@ impl ApiClient for ProviderRuntimeClient {
                 input_schema: spec.input_schema,
             })
             .collect::<Vec<_>>();
-        let message_request = MessageRequest {
-            model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
-            messages: convert_messages(&request.messages),
-            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: (!tools.is_empty()).then_some(tools),
-            tool_choice: (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto),
-            stream: true,
-        };
+        let messages = convert_messages(&request.messages);
+        let system =
+            (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
+        let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
 
-        self.runtime.block_on(async {
-            let mut stream = self
-                .client
-                .stream_message(&message_request)
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-            let mut events = Vec::new();
-            let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
-            let mut saw_stop = false;
+        let runtime = &self.runtime;
+        let chain = &self.chain;
+        let mut last_error: Option<ApiError> = None;
+        for (index, entry) in chain.iter().enumerate() {
+            let message_request = MessageRequest {
+                model: entry.model.clone(),
+                max_tokens: max_tokens_for_model(&entry.model),
+                messages: messages.clone(),
+                system: system.clone(),
+                tools: (!tools.is_empty()).then(|| tools.clone()),
+                tool_choice: tool_choice.clone(),
+                stream: true,
+                ..Default::default()
+            };
 
-            while let Some(event) = stream
-                .next_event()
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?
-            {
-                match event {
-                    ApiStreamEvent::MessageStart(start) => {
-                        for block in start.message.content {
-                            push_output_block(block, 0, &mut events, &mut pending_tools, true);
-                        }
-                    }
-                    ApiStreamEvent::ContentBlockStart(start) => {
-                        push_output_block(
-                            start.content_block,
-                            start.index,
-                            &mut events,
-                            &mut pending_tools,
-                            true,
-                        );
-                    }
-                    ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
-                        ContentBlockDelta::TextDelta { text } => {
-                            if !text.is_empty() {
-                                events.push(AssistantEvent::TextDelta(text));
-                            }
-                        }
-                        ContentBlockDelta::InputJsonDelta { partial_json } => {
-                            if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
-                                input.push_str(&partial_json);
-                            }
-                        }
-                        ContentBlockDelta::ThinkingDelta { .. }
-                        | ContentBlockDelta::SignatureDelta { .. } => {}
-                    },
-                    ApiStreamEvent::ContentBlockStop(stop) => {
-                        if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
-                            events.push(AssistantEvent::ToolUse { id, name, input });
-                        }
-                    }
-                    ApiStreamEvent::MessageDelta(delta) => {
-                        events.push(AssistantEvent::Usage(delta.usage.token_usage()));
-                    }
-                    ApiStreamEvent::MessageStop(_) => {
-                        saw_stop = true;
-                        events.push(AssistantEvent::MessageStop);
-                    }
+            let attempt = runtime.block_on(stream_with_provider(&entry.client, &message_request));
+            match attempt {
+                Ok(events) => return Ok(events),
+                Err(error) if error.is_retryable() && index + 1 < chain.len() => {
+                    eprintln!(
+                        "provider {} failed with retryable error, falling back: {error}",
+                        entry.model
+                    );
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(RuntimeError::new(error.to_string())),
+            }
+        }
+
+        Err(RuntimeError::new(
+            last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| String::from("provider chain exhausted with no attempts")),
+        ))
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn stream_with_provider(
+    client: &ProviderClient,
+    message_request: &MessageRequest,
+) -> Result<Vec<AssistantEvent>, ApiError> {
+    let mut stream = client.stream_message(message_request).await?;
+    let mut events = Vec::new();
+    let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
+    let mut saw_stop = false;
+
+    while let Some(event) = stream.next_event().await? {
+        match event {
+            ApiStreamEvent::MessageStart(start) => {
+                for block in start.message.content {
+                    push_output_block(block, 0, &mut events, &mut pending_tools, true);
                 }
             }
-
-            push_prompt_cache_record(&self.client, &mut events);
-
-            if !saw_stop
-                && events.iter().any(|event| {
-                    matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
-                        || matches!(event, AssistantEvent::ToolUse { .. })
-                })
-            {
+            ApiStreamEvent::ContentBlockStart(start) => {
+                push_output_block(
+                    start.content_block,
+                    start.index,
+                    &mut events,
+                    &mut pending_tools,
+                    true,
+                );
+            }
+            ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
+                ContentBlockDelta::TextDelta { text } => {
+                    if !text.is_empty() {
+                        events.push(AssistantEvent::TextDelta(text));
+                    }
+                }
+                ContentBlockDelta::InputJsonDelta { partial_json } => {
+                    if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
+                        input.push_str(&partial_json);
+                    }
+                }
+                ContentBlockDelta::ThinkingDelta { .. }
+                | ContentBlockDelta::SignatureDelta { .. } => {}
+            },
+            ApiStreamEvent::ContentBlockStop(stop) => {
+                if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
+                    events.push(AssistantEvent::ToolUse { id, name, input });
+                }
+            }
+            ApiStreamEvent::MessageDelta(delta) => {
+                events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+            }
+            ApiStreamEvent::MessageStop(_) => {
+                saw_stop = true;
                 events.push(AssistantEvent::MessageStop);
             }
-
-            if events
-                .iter()
-                .any(|event| matches!(event, AssistantEvent::MessageStop))
-            {
-                return Ok(events);
-            }
-
-            let response = self
-                .client
-                .send_message(&MessageRequest {
-                    stream: false,
-                    ..message_request.clone()
-                })
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-            let mut events = response_to_events(response);
-            push_prompt_cache_record(&self.client, &mut events);
-            Ok(events)
-        })
+        }
     }
+
+    push_prompt_cache_record(client, &mut events);
+
+    if !saw_stop
+        && events.iter().any(|event| {
+            matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
+                || matches!(event, AssistantEvent::ToolUse { .. })
+        })
+    {
+        events.push(AssistantEvent::MessageStop);
+    }
+
+    if events
+        .iter()
+        .any(|event| matches!(event, AssistantEvent::MessageStop))
+    {
+        return Ok(events);
+    }
+
+    let response = client
+        .send_message(&MessageRequest {
+            stream: false,
+            ..message_request.clone()
+        })
+        .await?;
+    let mut events = response_to_events(response);
+    push_prompt_cache_record(client, &mut events);
+    Ok(events)
 }
 
 struct SubagentToolExecutor {
@@ -5238,6 +5353,7 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 }
 
 pub mod lane_completion;
+pub mod pdf_extract;
 
 #[cfg(test)]
 mod tests {
@@ -5257,9 +5373,11 @@ mod tests {
         derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
         maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, SubagentToolExecutor,
+        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
+        SubagentToolExecutor,
     };
     use api::OutputContentBlock;
+    use runtime::ProviderFallbackConfig;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
         PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
@@ -5433,6 +5551,436 @@ mod tests {
         assert_eq!(accepted_output["status"], "running");
         assert_eq!(accepted_output["prompt_delivery_attempts"], 1);
         assert_eq!(accepted_output["prompt_in_flight"], true);
+    }
+
+    #[test]
+    fn worker_create_merges_config_trusted_roots_without_per_call_override() {
+        use std::fs;
+        // Write a .claw/settings.json in a temp dir with trustedRoots
+        let worktree = temp_path("config-trust-worktree");
+        let claw_dir = worktree.join(".claw");
+        fs::create_dir_all(&claw_dir).expect("create .claw dir");
+        // Use the actual OS temp dir so the worktree path matches the allowlist
+        let tmp_root = std::env::temp_dir().to_str().expect("utf-8").to_string();
+        let settings = format!("{{\"trustedRoots\": [\"{tmp_root}\"]}}");
+        fs::write(claw_dir.join("settings.json"), settings).expect("write settings");
+
+        // WorkerCreate with no per-call trusted_roots — config should supply them
+        let cwd = worktree.to_str().expect("valid utf-8").to_string();
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({
+                "cwd": cwd
+                // trusted_roots intentionally omitted
+            }),
+        )
+        .expect("WorkerCreate should succeed");
+        let output: serde_json::Value = serde_json::from_str(&created).expect("json");
+
+        // worktree is under /tmp, so config roots auto-resolve trust
+        assert_eq!(
+            output["trust_auto_resolve"], true,
+            "config-level trustedRoots should auto-resolve trust without per-call override"
+        );
+
+        fs::remove_dir_all(&worktree).ok();
+    }
+
+    #[test]
+    fn worker_terminate_sets_finished_status() {
+        // Create a worker in running state
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/tmp/terminate-test", "trusted_roots": ["/tmp"]}),
+        )
+        .expect("WorkerCreate should succeed");
+        let output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = output["worker_id"].as_str().expect("worker_id").to_string();
+
+        // Terminate
+        let terminated = execute_tool("WorkerTerminate", &json!({"worker_id": worker_id}))
+            .expect("WorkerTerminate should succeed");
+        let term_output: serde_json::Value = serde_json::from_str(&terminated).expect("json");
+        assert_eq!(
+            term_output["status"], "finished",
+            "terminated worker should be finished"
+        );
+        assert_eq!(
+            term_output["prompt_in_flight"], false,
+            "prompt_in_flight should be cleared on termination"
+        );
+    }
+
+    #[test]
+    fn worker_restart_resets_to_spawning() {
+        // Create and advance worker to ready_for_prompt
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/tmp/restart-test", "trusted_roots": ["/tmp"]}),
+        )
+        .expect("WorkerCreate should succeed");
+        let output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = output["worker_id"].as_str().expect("worker_id").to_string();
+
+        // Advance to ready_for_prompt via observe
+        execute_tool(
+            "WorkerObserve",
+            &json!({"worker_id": worker_id, "screen_text": "Ready for input\n>"}),
+        )
+        .expect("WorkerObserve should succeed");
+
+        // Restart
+        let restarted = execute_tool("WorkerRestart", &json!({"worker_id": worker_id}))
+            .expect("WorkerRestart should succeed");
+        let restart_output: serde_json::Value = serde_json::from_str(&restarted).expect("json");
+        assert_eq!(
+            restart_output["status"], "spawning",
+            "restarted worker should return to spawning"
+        );
+        assert_eq!(
+            restart_output["prompt_in_flight"], false,
+            "prompt_in_flight should be cleared on restart"
+        );
+        assert_eq!(
+            restart_output["trust_gate_cleared"], false,
+            "trust_gate_cleared should be reset on restart (re-trust required)"
+        );
+    }
+
+    #[test]
+    fn worker_get_returns_worker_state() {
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/tmp/worker-get-test", "trusted_roots": ["/tmp"]}),
+        )
+        .expect("WorkerCreate should succeed");
+        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = created_output["worker_id"].as_str().expect("worker_id");
+
+        let fetched = execute_tool("WorkerGet", &json!({"worker_id": worker_id}))
+            .expect("WorkerGet should succeed");
+        let fetched_output: serde_json::Value = serde_json::from_str(&fetched).expect("json");
+        assert_eq!(fetched_output["worker_id"], worker_id);
+        assert_eq!(fetched_output["status"], "spawning");
+        assert_eq!(fetched_output["cwd"], "/tmp/worker-get-test");
+    }
+
+    #[test]
+    fn worker_get_on_unknown_id_returns_error() {
+        let result = execute_tool(
+            "WorkerGet",
+            &json!({"worker_id": "worker_nonexistent_get_00000000"}),
+        );
+        assert!(
+            result.is_err(),
+            "WorkerGet on unknown id should return error"
+        );
+        assert!(
+            result.unwrap_err().contains("worker not found"),
+            "error should mention worker not found"
+        );
+    }
+
+    #[test]
+    fn worker_await_ready_on_spawning_worker_returns_not_ready() {
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/tmp/worker-await-not-ready"}),
+        )
+        .expect("WorkerCreate should succeed");
+        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = created_output["worker_id"].as_str().expect("worker_id");
+
+        // Worker is still in spawning — await_ready should return not-ready snapshot
+        let snapshot = execute_tool("WorkerAwaitReady", &json!({"worker_id": worker_id}))
+            .expect("WorkerAwaitReady should succeed even when not ready");
+        let snap_output: serde_json::Value = serde_json::from_str(&snapshot).expect("json");
+        assert_eq!(
+            snap_output["ready"], false,
+            "WorkerAwaitReady on a spawning worker must return ready=false"
+        );
+        assert_eq!(snap_output["worker_id"], worker_id);
+    }
+
+    #[test]
+    fn worker_send_prompt_on_non_ready_worker_returns_error() {
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/tmp/worker-send-not-ready"}),
+        )
+        .expect("WorkerCreate should succeed");
+        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = created_output["worker_id"].as_str().expect("worker_id");
+
+        let result = execute_tool(
+            "WorkerSendPrompt",
+            &json!({"worker_id": worker_id, "prompt": "too early"}),
+        );
+        assert!(
+            result.is_err(),
+            "WorkerSendPrompt on a non-ready worker should fail"
+        );
+    }
+
+    #[test]
+    fn recovery_loop_state_file_reflects_transitions() {
+        // End-to-end proof: .claw/worker-state.json reflects every transition
+        // through the stall-detect -> resolve-trust -> ready loop.
+        use std::fs;
+
+        // Use a real temp CWD so state file can be written
+        let worktree = temp_path("recovery-loop-state");
+        fs::create_dir_all(&worktree).expect("create worktree");
+        let cwd = worktree.to_str().expect("utf-8").to_string();
+        let state_path = worktree.join(".claw").join("worker-state.json");
+
+        // 1. Create worker WITHOUT trusted_roots
+        let created = execute_tool("WorkerCreate", &json!({"cwd": cwd}))
+            .expect("WorkerCreate should succeed");
+        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = created_output["worker_id"]
+            .as_str()
+            .expect("worker_id")
+            .to_string();
+        // State file should exist after create
+        assert!(
+            state_path.exists(),
+            "state file should be written after WorkerCreate"
+        );
+        let state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
+                .expect("parse state");
+        assert_eq!(state["status"], "spawning");
+        assert_eq!(state["is_ready"], false);
+        assert!(
+            state["seconds_since_update"].is_number(),
+            "seconds_since_update must be present"
+        );
+
+        // 2. Force trust_required via observe
+        execute_tool(
+            "WorkerObserve",
+            &json!({"worker_id": worker_id, "screen_text": "Do you trust the files in this folder?"}),
+        )
+        .expect("WorkerObserve should succeed");
+        let state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
+                .expect("parse state");
+        assert_eq!(
+            state["status"], "trust_required",
+            "state file must reflect trust_required stall"
+        );
+        assert_eq!(state["is_ready"], false);
+        assert_eq!(state["trust_gate_cleared"], false);
+        assert!(state["seconds_since_update"].is_number());
+
+        // 3. WorkerResolveTrust -> state file reflects recovery
+        execute_tool("WorkerResolveTrust", &json!({"worker_id": worker_id}))
+            .expect("WorkerResolveTrust should succeed");
+        let state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
+                .expect("parse state");
+        assert_eq!(
+            state["status"], "spawning",
+            "state file must show spawning after trust resolved"
+        );
+        assert_eq!(state["trust_gate_cleared"], true);
+
+        // 4. Observe ready screen -> state file shows ready_for_prompt
+        execute_tool(
+            "WorkerObserve",
+            &json!({"worker_id": worker_id, "screen_text": "Ready for input\n>"}),
+        )
+        .expect("WorkerObserve ready should succeed");
+        let state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
+                .expect("parse state");
+        assert_eq!(
+            state["status"], "ready_for_prompt",
+            "state file must show ready_for_prompt after ready screen"
+        );
+        assert_eq!(
+            state["is_ready"], true,
+            "is_ready must be true in state file at ready_for_prompt"
+        );
+
+        fs::remove_dir_all(&worktree).ok();
+    }
+
+    #[test]
+    fn stall_detect_and_resolve_trust_end_to_end() {
+        // 1. Create worker WITHOUT trusted_roots so trust won't auto-resolve
+        let created = execute_tool("WorkerCreate", &json!({"cwd": "/no/trusted/root/here"}))
+            .expect("WorkerCreate should succeed");
+        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = created_output["worker_id"]
+            .as_str()
+            .expect("worker_id")
+            .to_string();
+        assert_eq!(created_output["trust_auto_resolve"], false);
+
+        // 2. Observe trust prompt screen text -> worker stalls at trust_required
+        let stalled = execute_tool(
+            "WorkerObserve",
+            &json!({
+                "worker_id": worker_id,
+                "screen_text": "Do you trust the files in this folder?\n[Allow] [Deny]"
+            }),
+        )
+        .expect("WorkerObserve should succeed");
+        let stalled_output: serde_json::Value = serde_json::from_str(&stalled).expect("json");
+        assert_eq!(
+            stalled_output["status"], "trust_required",
+            "worker should stall at trust_required when trust prompt seen without allowlist"
+        );
+        assert_eq!(stalled_output["trust_gate_cleared"], false);
+        // 3. Clawhip calls WorkerResolveTrust to unblock
+        let resolved = execute_tool("WorkerResolveTrust", &json!({"worker_id": worker_id}))
+            .expect("WorkerResolveTrust should succeed");
+        let resolved_output: serde_json::Value = serde_json::from_str(&resolved).expect("json");
+        assert_eq!(
+            resolved_output["status"], "spawning",
+            "worker should return to spawning after trust resolved"
+        );
+        assert_eq!(resolved_output["trust_gate_cleared"], true);
+
+        // 4. Ready screen text now advances worker normally
+        let ready = execute_tool(
+            "WorkerObserve",
+            &json!({
+                "worker_id": worker_id,
+                "screen_text": "Ready for input\n>"
+            }),
+        )
+        .expect("WorkerObserve should succeed after trust resolved");
+        let ready_output: serde_json::Value = serde_json::from_str(&ready).expect("json");
+        assert_eq!(
+            ready_output["status"], "ready_for_prompt",
+            "worker should reach ready_for_prompt after trust resolved and ready screen seen"
+        );
+    }
+
+    #[test]
+    fn stall_detect_and_restart_recovery_end_to_end() {
+        // Worker stalls at trust_required, clawhip restarts instead of resolving
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/no/trusted/root/restart-test"}),
+        )
+        .expect("WorkerCreate should succeed");
+        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = created_output["worker_id"]
+            .as_str()
+            .expect("worker_id")
+            .to_string();
+
+        // Force trust_required
+        let stalled = execute_tool(
+            "WorkerObserve",
+            &json!({
+                "worker_id": worker_id,
+                "screen_text": "trust this folder? [Yes] [No]"
+            }),
+        )
+        .expect("WorkerObserve should succeed");
+        let stalled_output: serde_json::Value = serde_json::from_str(&stalled).expect("json");
+        assert_eq!(stalled_output["status"], "trust_required");
+
+        // WorkerRestart resets the worker
+        let restarted = execute_tool("WorkerRestart", &json!({"worker_id": worker_id}))
+            .expect("WorkerRestart should succeed");
+        let restarted_output: serde_json::Value = serde_json::from_str(&restarted).expect("json");
+        assert_eq!(
+            restarted_output["status"], "spawning",
+            "restarted worker should be back at spawning"
+        );
+        assert_eq!(
+            restarted_output["trust_gate_cleared"], false,
+            "restart clears trust — next observe loop must re-acquire trust"
+        );
+    }
+
+    #[test]
+    fn worker_terminate_on_unknown_id_returns_error() {
+        let result = execute_tool(
+            "WorkerTerminate",
+            &json!({"worker_id": "worker_nonexistent_00000000"}),
+        );
+        assert!(result.is_err(), "terminating unknown worker should fail");
+        assert!(
+            result.unwrap_err().contains("worker not found"),
+            "error should mention worker not found"
+        );
+    }
+
+    #[test]
+    fn worker_restart_on_unknown_id_returns_error() {
+        let result = execute_tool(
+            "WorkerRestart",
+            &json!({"worker_id": "worker_nonexistent_00000001"}),
+        );
+        assert!(result.is_err(), "restarting unknown worker should fail");
+        assert!(
+            result.unwrap_err().contains("worker not found"),
+            "error should mention worker not found"
+        );
+    }
+
+    #[test]
+    fn worker_observe_completion_success_finish_sets_finished_status() {
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/tmp/observe-completion-test", "trusted_roots": ["/tmp"]}),
+        )
+        .expect("WorkerCreate should succeed");
+        let output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = output["worker_id"].as_str().expect("worker_id").to_string();
+
+        let completed = execute_tool(
+            "WorkerObserveCompletion",
+            &json!({
+                "worker_id": worker_id,
+                "finish_reason": "end_turn",
+                "tokens_output": 512
+            }),
+        )
+        .expect("WorkerObserveCompletion should succeed");
+        let completed_output: serde_json::Value = serde_json::from_str(&completed).expect("json");
+        assert_eq!(completed_output["status"], "finished");
+        assert_eq!(completed_output["prompt_in_flight"], false);
+    }
+
+    #[test]
+    fn worker_observe_completion_degraded_provider_sets_failed_status() {
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/tmp/observe-degraded-test", "trusted_roots": ["/tmp"]}),
+        )
+        .expect("WorkerCreate should succeed");
+        let output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = output["worker_id"].as_str().expect("worker_id").to_string();
+
+        // finish=unknown + 0 tokens = degraded provider classification
+        let failed = execute_tool(
+            "WorkerObserveCompletion",
+            &json!({
+                "worker_id": worker_id,
+                "finish_reason": "unknown",
+                "tokens_output": 0
+            }),
+        )
+        .expect("WorkerObserveCompletion should succeed");
+        let failed_output: serde_json::Value = serde_json::from_str(&failed).expect("json");
+        assert_eq!(
+            failed_output["status"], "failed",
+            "finish=unknown + 0 tokens should classify as provider failure"
+        );
+        assert_eq!(failed_output["prompt_in_flight"], false);
+        // last_error should be set with provider failure message
+        assert!(
+            !failed_output["last_error"].is_null(),
+            "last_error should be populated for provider failure"
+        );
     }
 
     #[test]
@@ -5701,6 +6249,14 @@ mod tests {
 
     #[test]
     fn web_search_extracts_and_filters_results() {
+        // Serialize env-var mutation so this test cannot race with the sibling
+        // web_search_handles_generic_links_and_invalid_base_url test that also
+        // sets CLAWD_WEB_SEARCH_BASE_URL. Without the lock, parallel test
+        // runners can interleave the set/remove calls and cause assertion
+        // failures on the wrong port.
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
             assert!(request_line.contains("GET /search?q=rust+web+search "));
             HttpResponse::html(
@@ -7767,6 +8323,151 @@ printf 'pwsh:%s' "$1"
             .expect("bash should succeed without enforcer");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "ok");
+    }
+
+    #[test]
+    fn provider_runtime_client_chain_uses_only_primary_when_no_fallbacks_configured() {
+        // given
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
+        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
+        let fallback_config = ProviderFallbackConfig::default();
+
+        // when
+        let client = ProviderRuntimeClient::new_with_fallback_config(
+            "claude-sonnet-4-6".to_string(),
+            BTreeSet::new(),
+            &fallback_config,
+        )
+        .expect("primary-only chain should construct");
+
+        // then
+        assert_eq!(client.chain.len(), 1);
+        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
+
+        match original_anthropic {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn provider_runtime_client_chain_appends_configured_fallbacks_in_order() {
+        // given
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
+        let original_xai = std::env::var_os("XAI_API_KEY");
+        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
+        std::env::set_var("XAI_API_KEY", "xai-test-key");
+        let fallback_config = ProviderFallbackConfig::new(
+            None,
+            vec!["grok-3".to_string(), "grok-3-mini".to_string()],
+        );
+
+        // when
+        let client = ProviderRuntimeClient::new_with_fallback_config(
+            "claude-sonnet-4-6".to_string(),
+            BTreeSet::new(),
+            &fallback_config,
+        )
+        .expect("chain with fallbacks should construct");
+
+        // then
+        assert_eq!(client.chain.len(), 3);
+        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
+        assert_eq!(client.chain[1].model, "grok-3");
+        assert_eq!(client.chain[2].model, "grok-3-mini");
+
+        match original_anthropic {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        match original_xai {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn provider_runtime_client_chain_primary_override_replaces_constructor_model() {
+        // given
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
+        let original_xai = std::env::var_os("XAI_API_KEY");
+        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
+        std::env::set_var("XAI_API_KEY", "xai-test-key");
+        let fallback_config = ProviderFallbackConfig::new(
+            Some("grok-3".to_string()),
+            vec!["claude-sonnet-4-6".to_string()],
+        );
+
+        // when
+        let client = ProviderRuntimeClient::new_with_fallback_config(
+            "claude-haiku-4-5-20251213".to_string(),
+            BTreeSet::new(),
+            &fallback_config,
+        )
+        .expect("chain with primary override should construct");
+
+        // then
+        assert_eq!(client.chain.len(), 2);
+        assert_eq!(client.chain[0].model, "grok-3");
+        assert_eq!(client.chain[1].model, "claude-sonnet-4-6");
+
+        match original_anthropic {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        match original_xai {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn provider_runtime_client_chain_skips_fallbacks_missing_credentials() {
+        // given
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
+        let original_xai = std::env::var_os("XAI_API_KEY");
+        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
+        std::env::remove_var("XAI_API_KEY");
+        let fallback_config = ProviderFallbackConfig::new(
+            None,
+            vec![
+                "grok-3".to_string(),
+                "claude-haiku-4-5-20251213".to_string(),
+            ],
+        );
+
+        // when
+        let client = ProviderRuntimeClient::new_with_fallback_config(
+            "claude-sonnet-4-6".to_string(),
+            BTreeSet::new(),
+            &fallback_config,
+        )
+        .expect("chain construction should not fail when only some fallbacks are unavailable");
+
+        // then
+        assert_eq!(client.chain.len(), 2);
+        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
+        assert_eq!(client.chain[1].model, "claude-haiku-4-5-20251213");
+
+        match original_anthropic {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        if let Some(value) = original_xai {
+            std::env::set_var("XAI_API_KEY", value);
+        }
     }
 
     #[test]

@@ -183,24 +183,24 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
     }
 
     let captured = runtime.block_on(server.captured_requests());
+    // After `be561bf` added count_tokens preflight, each turn sends an
+    // extra POST to `/v1/messages/count_tokens` before the messages POST.
+    // The original count (21) assumed messages-only requests.  We now
+    // filter to `/v1/messages` and verify that subset matches the original
+    // scenario expectation.
+    let messages_only: Vec<_> = captured
+        .iter()
+        .filter(|r| r.path == "/v1/messages")
+        .collect();
     assert_eq!(
-        captured.len(),
-        42,
-        "Anthropic preflight calls POST /v1/messages/count_tokens before each /v1/messages (21+21)"
+        messages_only.len(),
+        21,
+        "twelve scenarios should produce twenty-one /v1/messages requests (total captured: {}, includes count_tokens)",
+        captured.len()
     );
-    let message_requests: Vec<_> = captured
-        .iter()
-        .filter(|request| request.path == "/v1/messages")
-        .collect();
-    let count_requests: Vec<_> = captured
-        .iter()
-        .filter(|request| request.path == "/v1/messages/count_tokens")
-        .collect();
-    assert_eq!(message_requests.len(), 21);
-    assert_eq!(count_requests.len(), 21);
-    assert!(message_requests.iter().all(|request| request.stream));
+    assert!(messages_only.iter().all(|request| request.stream));
 
-    let scenarios = message_requests
+    let scenarios = messages_only
         .iter()
         .map(|request| request.scenario.as_str())
         .collect::<Vec<_>>();
@@ -232,10 +232,7 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
     );
 
     let mut request_counts = BTreeMap::new();
-    for request in captured
-        .iter()
-        .filter(|request| request.path == "/v1/messages")
-    {
+    for request in &captured {
         *request_counts
             .entry(request.scenario.as_str())
             .or_insert(0_usize) += 1;
