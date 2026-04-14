@@ -26,12 +26,39 @@ claw --model deepseek-chat --permission-mode workspace-write prompt \
 
 Швидкий старт з сорцу:
 
+> [!NOTE]
+> [!WARNING]
+> **`cargo install claw-code` installs the wrong thing.** The `claw-code` crate on crates.io is a deprecated stub that places `claw-code-deprecated.exe` — not `claw`. Running it only prints `"claw-code has been renamed to agent-code"`. **Do not use `cargo install claw-code`.** Either build from source (this repo) or install the upstream binary:
+> ```bash
+> cargo install agent-code   # upstream binary — installs 'agent.exe' (Windows) / 'agent' (Unix), NOT 'agent-code'
+> ```
+> This repo (`ultraworkers/claw-code`) is **build-from-source only** — follow the steps below.
+
 ```bash
-cd rust
+# 1. Clone and build
+git clone https://github.com/ultraworkers/claw-code
+cd claw-code/rust
 cargo build --workspace
 ./target/debug/claw --help
+
+# 2. Set your API key
+export ANTHROPIC_API_KEY="sk-ant-..."
+# or DeepSeek:
+export DEEPSEEK_API_KEY="sk-..."
+
+# 3. Verify everything is wired correctly
+./target/debug/claw doctor
+
+# 4. Run a prompt
+./target/debug/claw prompt "say hello"
 ```
+
+## Документація
+
+- `USAGE.md` — команди CLI, auth, сесії, конфіг, parity harness
+- `rust/README.md` — структура Rust workspace та деталі CLI
+- `ROADMAP.md` — активний roadmap
 
 ## Ліцензія
 
-Як у апстрімі (див. [LICENSE](LICENSE) у дереві).
+Як у апстрімі (див. `LICENSE` у дереві).

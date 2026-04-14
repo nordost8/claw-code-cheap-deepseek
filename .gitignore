@@ -12,3 +12,8 @@ archive/
 # Claude Code local artifacts (never commit — may contain chat/tool transcripts)
 .claude/settings.local.json
 .claude/sessions/
+# Claw Code local artifacts
+.claw/settings.local.json
+.claw/sessions/
+.clawhip/
+status-help.txt
