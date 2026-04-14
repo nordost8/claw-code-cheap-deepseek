@@ -1,6 +1,12 @@
 # claw-code-cheap-deepseek
 
-Fork of **[Claw Code](https://github.com/instructkr/claw-code)** (upstream: `instructkr/claw-code`) tuned for **[DeepSeek](https://www.deepseek.com/)** via **`DEEPSEEK_API_KEY`**. Anthropic / OpenAI / xAI шляхи лишаються там, де їх підтримує апстрім.
+Fork of upstream **Claw Code** with **DeepSeek (OpenAI-compatible) support** (`deepseek-chat`, `deepseek-reasoner`) via **`DEEPSEEK_API_KEY`**.
+
+- **Upstream**: `https://github.com/instructkr/claw-code`
+- **Telegram bot (Ductor)**: `https://github.com/nordost8/ductor-claw-code`
+- **Ecosystem map**: [`ECOSYSTEM.md`](./ECOSYSTEM.md)
+
+If you **don't need DeepSeek**, prefer upstream.
 
 ## Швидкий приклад CLI
 
