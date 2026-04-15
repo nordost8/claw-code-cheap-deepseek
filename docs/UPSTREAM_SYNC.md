@@ -68,13 +68,3 @@ Helper (prints safe next step):
 ## If upstream changes the CLI contract
 
 If `claw prompt` / JSON shape / flags change, **Ductor’s** `claw_provider.py` (sibling repo `ductor-claw-code`) may need a matching update. See that repo’s `docs/UPSTREAM_SYNC.md`.
-
----
-
-## Українською
-
-**Архітектура:** твій **`main`** = апстрім Claw + тонкий шар патчів (DeepSeek). **`upstream`** завжди вказує на основний репо Claw.
-
-**Оновлення:** `git fetch upstream` → `merge` або `rebase` на `upstream/main` → вирішуєш конфлікти переважно в таблиці файлів вище → `cargo test` / збірка → пуш на **`origin`**.
-
-Конфліктів найбільше чекати в **`rusty-claude-cli/src/main.rs`** і провайдерах API. Після великих змін у CLI перевір сумісність із **Ductor** (`ductor-claw-code`).

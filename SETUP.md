@@ -94,16 +94,3 @@ Log each sync in **`CHANGELOG_FORK.md`**.
 
 See **`GITHUB_SETUP.md`**.
 
----
-
-## Українською
-
-**Рекомендована назва репозиторія на GitHub (англійською): `claw-code-cheap-deepseek`** — одразу видно, що це Claw під **дешевий DeepSeek**.
-
-Що зробити: встановити **Rust**, скопіювати **`.env.example` → `.env`**, додати **`DEEPSEEK_API_KEY`**, зібрати **`cd rust && cargo build --release`**, покласти **`claw`** у **`PATH`**. Перевірка — одна команда `prompt` з `--model deepseek-chat` (див. розділ **Quick test** вище).
-
-Для бота в Telegram — другий репо **`ductor-claw-code`**, там свій **`SETUP.md`**.
-
-Публікація на GitHub — **`GITHUB_SETUP.md`**.
-
-Оновлення з основного Claw: **`docs/UPSTREAM_SYNC.md`**, скрипт **`./scripts/sync-upstream.sh`**.
